@@ -13,9 +13,7 @@ on:
     branches:
       - main
       - "release-branch/*"
-    paths:
-      - .github/workflows/vet.yml
-      - "**.go"
+      - "source/*"
   pull_request:
     paths:
       - .github/workflows/vet.yml
