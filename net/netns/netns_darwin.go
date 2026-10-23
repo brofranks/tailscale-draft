@@ -147,6 +147,11 @@ func getInterfaceIndex(logf logger.Logf, netMon *netmon.Monitor, address string)
 // If none is found, (nil, nil) is returned.
 // A non-nil error is only returned on a problem listing the system interfaces.
 func tailscaleInterface() (*net.Interface, error) {
+	// A registered interface identifies the tunnel even when its
+	// addresses lie outside Tailscale's ranges.
+	if idx, err := netmon.TailscaleInterfaceIndex(); err == nil {
+		return net.InterfaceByIndex(idx)
+	}
 	ifs, err := net.Interfaces()
 	if err != nil {
 		return nil, err

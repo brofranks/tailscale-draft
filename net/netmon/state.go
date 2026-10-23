@@ -57,18 +57,20 @@ func isProblematicInterface(nif *net.Interface) bool {
 // it will return any IPv4 linklocal or IPv6 unique local addresses because we
 // know of environments where these are used with NAT to provide connectivity.
 func LocalAddresses() (regular, loopback []netip.Addr, err error) {
-	// TODO(crawshaw): don't serve interface addresses that we are routing
 	ifaces, err := netInterfaces()
 	if err != nil {
 		return nil, nil, err
 	}
+	// The Tailscale interface's addresses are routed over Tailscale itself,
+	// whatever range they come from, so they are never local endpoints.
+	tsIfName, _ := TailscaleInterfaceName()
 	var regular4, regular6, linklocal4, ula6 []netip.Addr
 	for _, iface := range ifaces {
 		stdIf := iface.Interface
-		if !isUp(stdIf) || isProblematicInterface(stdIf) {
-			// Skip down interfaces and ones that are
-			// problematic that we don't want to try to
-			// send Tailscale traffic over.
+		if !isUp(stdIf) || isProblematicInterface(stdIf) || stdIf.Name == tsIfName {
+			// Skip down interfaces, the Tailscale interface, and
+			// ones that are problematic that we don't want to try
+			// to send Tailscale traffic over.
 			continue
 		}
 		ifcIsLoopback := isLoopback(stdIf)

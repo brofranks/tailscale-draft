@@ -4,6 +4,7 @@
 package netns
 
 import (
+	"net"
 	"testing"
 
 	"tailscale.com/net/netmon"
@@ -81,4 +82,21 @@ func TestGetInterfaceIndex(t *testing.T) {
 			t.Fatalf("got idx=%d, want %d", idx, defaultIdx)
 		}
 	})
+}
+
+func TestTailscaleInterfaceRegistered(t *testing.T) {
+	lo, err := net.InterfaceByName("lo0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	netmon.SetTailscaleInterfaceProps(lo.Name, lo.Index)
+	t.Cleanup(func() { netmon.SetTailscaleInterfaceProps("", 0) })
+
+	got, err := tailscaleInterface()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Index != lo.Index {
+		t.Errorf("tailscaleInterface = %v, want %v", got, lo)
+	}
 }
