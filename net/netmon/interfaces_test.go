@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net"
 	"net/netip"
+	"slices"
 	"testing"
 
 	"tailscale.com/tstest"
@@ -123,6 +124,33 @@ func TestLikelyHomeRouterIP(t *testing.T) {
 			t.Fatal("expected no success")
 		}
 	})
+}
+
+func TestLocalAddressesSkipsTailscaleInterface(t *testing.T) {
+	up := net.FlagUp | net.FlagBroadcast | net.FlagMulticast | net.FlagRunning
+	tstest.Replace(t, &altNetInterfaces, func() ([]Interface, error) {
+		return []Interface{
+			{
+				Interface: &net.Interface{Index: 1, MTU: 1500, Name: "eth0", Flags: up},
+				AltAddrs:  []net.Addr{&net.IPNet{IP: net.ParseIP("192.0.2.10"), Mask: net.CIDRMask(24, 32)}},
+			},
+			{
+				// The tunnel holds an address outside Tailscale's ranges.
+				Interface: &net.Interface{Index: 2, MTU: 1280, Name: "wg0", Flags: up},
+				AltAddrs:  []net.Addr{&net.IPNet{IP: net.ParseIP("198.51.100.1"), Mask: net.CIDRMask(24, 32)}},
+			},
+		}, nil
+	})
+	SetTailscaleInterfaceProps("wg0", 2)
+	t.Cleanup(func() { tsIfProps.set("", 0) })
+
+	regular, _, err := LocalAddresses()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []netip.Addr{netip.MustParseAddr("192.0.2.10")}; !slices.Equal(regular, want) {
+		t.Errorf("LocalAddresses = %v, want %v", regular, want)
+	}
 }
 
 // https://github.com/tailscale/tailscale/issues/10466
