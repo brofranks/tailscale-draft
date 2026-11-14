@@ -86,6 +86,7 @@ type endpoint struct {
 	lastSendExt               mono.Time      // last time there were outgoing packets sent to this peer from an external trigger (e.g. wireguard-go or disco pingCLI)
 	lastSendAny               mono.Time      // last time there were outgoing packets sent this peer from any trigger, internal or external to magicsock
 	lastFullPing              mono.Time      // last time we pinged all disco or wireguard only endpoints
+	lastCallMeMaybe           mono.Time      // last time we queued CallMeMaybe
 	lastUDPRelayPathDiscovery mono.Time      // last time we ran UDP relay path discovery
 	derpAddr                  netip.AddrPort // fallback/bootstrap path, if non-zero (non-zero for well-behaved clients)
 
@@ -1448,12 +1449,17 @@ func (de *endpoint) sendDiscoPingsLocked(now mono.Time, sendCallMeMaybe bool) {
 		de.startDiscoPingLocked(epAddr{ap: ep}, now, pingDiscovery, 0, nil)
 	}
 	derpAddr := de.derpAddr
-	if buildfeatures.HasNATTraversal && sentAny && sendCallMeMaybe && derpAddr.IsValid() {
+	// A round can send no ping because the peer's endpoints are unknown or
+	// incoming CallMeMaybes keep every ping rate-limited. Still send a
+	// CallMeMaybe, unless one went out within discoPingInterval.
+	due := de.lastCallMeMaybe.IsZero() || now.Sub(de.lastCallMeMaybe) >= discoPingInterval
+	if buildfeatures.HasNATTraversal && (sentAny || due) && sendCallMeMaybe && derpAddr.IsValid() {
+		de.lastCallMeMaybe = now
 		// Have our magicsock.Conn figure out its STUN endpoint (if
 		// it doesn't know already) and then send a CallMeMaybe
-		// message to our peer via DERP informing them that we've
-		// sent so our firewall ports are probably open and now
-		// would be a good time for them to connect.
+		// message to our peer via DERP informing them that now
+		// would be a good time for them to connect. If we sent
+		// pings, our firewall ports are probably open.
 		go de.c.enqueueCallMeMaybe(derpAddr, de)
 	}
 }
@@ -2294,6 +2300,7 @@ func (de *endpoint) resetLocked() {
 func (de *endpoint) invalidateDiscoPathLocked() {
 	de.lastSendExt = 0
 	de.lastFullPing = 0
+	de.lastCallMeMaybe = 0
 	de.lastUDPRelayPathDiscovery = 0
 	for _, es := range de.endpointState {
 		es.lastPing = 0

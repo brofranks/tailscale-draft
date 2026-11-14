@@ -1136,6 +1136,36 @@ func newPinger(t *testing.T, logf logger.Logf, src, dst *magicStack) (cleanup fu
 // TestActiveDiscovery for the various configurations of devices that
 // get exercised.
 func testActiveDiscovery(t *testing.T, d *devices) {
+	t.Helper()
+	for _, tt := range []struct {
+		name    string
+		missing [2]bool
+	}{
+		{name: "neither"},
+		{name: "both", missing: [2]bool{true, true}},
+		{name: "initiator", missing: [2]bool{true, false}},
+		{name: "receiver", missing: [2]bool{false, true}},
+	} {
+		t.Run("missing-endpoints="+tt.name, func(t *testing.T) {
+			testActiveDiscoveryWithEndpoints(t, d, func(idx int, nm *netmap.NetworkMap) {
+				if !tt.missing[idx] {
+					return
+				}
+				for i, peer := range nm.Peers {
+					node := peer.AsStruct()
+					node.Endpoints = nil
+					nm.Peers[i] = node.View()
+				}
+			})
+		})
+	}
+}
+
+func testActiveDiscoveryWithEndpoints(
+	t *testing.T,
+	d *devices,
+	mutateNetmap func(int, *netmap.NetworkMap),
+) {
 	tstest.PanicOnLog()
 
 	tlogf, setT := makeNestable(t)
@@ -1158,7 +1188,7 @@ func testActiveDiscovery(t *testing.T, d *devices) {
 	m2 := newMagicStack(t, logger.WithPrefix(logf, "conn2: "), d.m2, derpMap)
 	defer m2.Close()
 
-	cleanup = meshStacks(logf, nil, m1, m2)
+	cleanup = meshStacks(logf, mutateNetmap, m1, m2)
 	defer cleanup()
 
 	m1IP := m1.IP()

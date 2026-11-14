@@ -6,6 +6,7 @@ package magicsock
 import (
 	"fmt"
 	"net/netip"
+	"slices"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -595,6 +596,117 @@ func Test_endpoint_sendDiscoPingsLocked_neverDirectUDP(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Test_endpoint_sendDiscoPingsLocked_callMeMaybe checks the send path
+// with in-memory packet writes, so queued packets and rate boundaries
+// are deterministic.
+func Test_endpoint_sendDiscoPingsLocked_callMeMaybe(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		lastWrite := time.Now()
+		writes := make(chan derpWriteRequest, 8)
+		c := &Conn{
+			logf:              t.Logf,
+			privateKey:        key.NewNode(),
+			peerMap:           newPeerMap(),
+			discoInfo:         make(map[key.DiscoPublic]*discoInfo),
+			peerLastDerp:      make(map[key.NodePublic]tailcfg.DERPRegionID),
+			lastEndpointsTime: time.Now(),
+			derpMap: &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
+				1: {RegionID: 1},
+			}},
+			activeDerp: map[tailcfg.DERPRegionID]activeDerp{
+				1: {writeCh: writes, lastWrite: &lastWrite},
+			},
+		}
+		c.discoAtomic.Set(key.NewDisco())
+		c.pconn4.setConnLocked(&scriptedPacketConn{}, "udp4", nil)
+		peerDisco := key.NewDisco()
+		de := &endpoint{
+			c:             c,
+			nodeID:        1,
+			publicKey:     key.NewNode().Public(),
+			derpAddr:      netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, 1),
+			sentPing:      make(map[stun.TxID]sentPing),
+			endpointState: make(map[netip.AddrPort]*endpointState),
+		}
+		de.updateDiscoKey(peerDisco.Public())
+		c.peerMap.upsertEndpoint(de, key.DiscoPublic{}, false)
+		// discover runs a discovery round and checks how many CallMeMaybes
+		// the endpoint has queued for the relay so far.
+		var queued []derpWriteRequest
+		discover := func(want int) {
+			t.Helper()
+			de.mu.Lock()
+			de.sendDiscoPingsLocked(mono.Now(), true)
+			de.mu.Unlock()
+			synctest.Wait()
+			for len(writes) > 0 {
+				queued = append(queued, <-writes)
+			}
+			if got := len(queued); got != want {
+				t.Fatalf("queued %d CallMeMaybes, want %d", got, want)
+			}
+		}
+		// With none of the peer's endpoints known, a round pings nothing
+		// and still sends one per interval.
+		discover(1)
+		discover(1)
+		localEPs := []netip.AddrPort{
+			netip.MustParseAddrPort("192.0.2.2:1234"),
+			netip.MustParseAddrPort("[2001:db8::2]:1234"),
+		}
+		c.mu.Lock()
+		for _, ep := range localEPs {
+			c.lastEndpoints = append(c.lastEndpoints, tailcfg.Endpoint{Addr: ep})
+		}
+		c.mu.Unlock()
+		time.Sleep(discoPingInterval - time.Nanosecond)
+		discover(1)
+		time.Sleep(time.Nanosecond)
+		discover(2)
+		// Each CallMeMaybe carries our current endpoints, including an empty
+		// set.
+		for i, want := range [][]netip.AddrPort{nil, localEPs} {
+			clear, ok := peerDisco.Shared(c.discoAtomic.Public()).Open(queued[i].b[len(disco.Magic)+key.DiscoPublicRawLen:])
+			if !ok {
+				t.Fatal("cannot open queued CallMeMaybe")
+			}
+			msg, err := disco.Parse(clear)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cmm, ok := msg.(*disco.CallMeMaybe); !ok || !slices.Equal(cmm.MyNumber, want) {
+				t.Fatalf("queued message %d = %#v, want CallMeMaybe with endpoints %v", i, msg, want)
+			}
+		}
+		// The peer's CallMeMaybes arrive more often than discoPingInterval,
+		// so every ping is always rate-limited.
+		ep := netip.MustParseAddrPort("192.0.2.1:7")
+		fromPeer := &disco.CallMeMaybe{MyNumber: []netip.AddrPort{ep}}
+		de.handleCallMeMaybe(fromPeer)
+		discover(2)
+		time.Sleep(discoPingInterval - time.Nanosecond)
+		de.handleCallMeMaybe(fromPeer)
+		discover(2)
+		time.Sleep(time.Nanosecond)
+		de.handleCallMeMaybe(fromPeer)
+		discover(3)
+		// A round that pings sends one whatever the interval, and the
+		// interval then runs from that one.
+		time.Sleep(discoPingInterval / 2)
+		de.endpointState[ep].lastPing = 0
+		discover(4)
+		time.Sleep(discoPingInterval / 2)
+		de.handleCallMeMaybe(fromPeer)
+		discover(4)
+		time.Sleep(discoPingInterval/2 - time.Nanosecond)
+		de.handleCallMeMaybe(fromPeer)
+		discover(4)
+		time.Sleep(time.Nanosecond)
+		de.handleCallMeMaybe(fromPeer)
+		discover(5)
+	})
 }
 
 func Test_endpoint_updateFromNodeAfterDiscoKeyChange(t *testing.T) {
@@ -1240,6 +1352,7 @@ func TestChangedActiveDiscoLocked(t *testing.T) {
 		de := &endpoint{}
 		de.lastSendExt = mono.Now()
 		de.lastFullPing = mono.Now()
+		de.lastCallMeMaybe = mono.Now()
 		de.lastUDPRelayPathDiscovery = mono.Now()
 		de.isWireguardOnly = true // avoid sentPing iteration, which requires de.c
 		de.mu.Lock()
@@ -1250,6 +1363,9 @@ func TestChangedActiveDiscoLocked(t *testing.T) {
 		}
 		if de.lastFullPing != 0 {
 			t.Error("lastFullPing not reset to zero")
+		}
+		if de.lastCallMeMaybe != 0 {
+			t.Error("lastCallMeMaybe not reset to zero")
 		}
 		if de.lastUDPRelayPathDiscovery != 0 {
 			t.Error("lastUDPRelayPathDiscovery not reset to zero")
