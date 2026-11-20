@@ -99,3 +99,21 @@ func TestIgnoreDuplicateNEWADDR(t *testing.T) {
 		}
 	})
 }
+
+func TestTunnelAddressEvents(t *testing.T) {
+	oldName, oldIndex := tsIfProps.tsIfName(), tsIfProps.tsIfIndex()
+	t.Cleanup(func() { tsIfProps.set(oldName, oldIndex) })
+	for _, index := range []int{0, 7} {
+		tsIfProps.set("wg0", index)
+		for _, ifIndex := range []uint32{7, 8} {
+			for _, addr := range []string{"100.70.1.4", "10.22.3.5", "fd7a:115c:a1e0::9"} {
+				for _, del := range []bool{false, true} {
+					msg := newAddrMessage{IfIndex: ifIndex, Addr: netip.MustParseAddr(addr), Delete: del}
+					if got, want := msg.ignore(), index == int(ifIndex); got != want {
+						t.Errorf("index=%d message=%+v ignore=%v, want %v", index, msg, got, want)
+					}
+				}
+			}
+		}
+	}
+}

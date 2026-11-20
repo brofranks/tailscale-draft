@@ -303,7 +303,8 @@ type newAddrMessage struct {
 }
 
 func (m *newAddrMessage) ignore() bool {
-	return tsaddr.IsTailscaleIP(m.Addr)
+	index := tsIfProps.tsIfIndex()
+	return index > 0 && uint32(index) == m.IfIndex
 }
 
 type ignoreMessage struct{}
