@@ -1,0 +1,45 @@
+name: Headwire Windows firewall ownership
+on:
+  push:
+    branches: [rehearsal-cleanup-262a9f6f]
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.27.4'
+          cache: false
+      - name: Build the release candidate on the seven-patch source
+        shell: bash
+        run: |
+          set -euo pipefail
+          go install github.com/tailscale/tailcat/cmd/tailcat@52fbad323e9d352f1febb623e0975368e9a8cbdd
+          git apply rehearsal-cleanup/candidate.patch
+          cp rehearsal-cleanup/ownership_probe_windows_test.go wgengine/router/osrouter/
+          mkdir -p "$RUNNER_TEMP/probe"
+          curl --fail --silent --show-error --location https://www.wintun.net/builds/wintun-0.14.1.zip -o "$RUNNER_TEMP/probe/wintun.zip"
+          cd "$RUNNER_TEMP/probe"
+          echo '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51  wintun.zip' | sha256sum -c -
+          unzip -j wintun.zip wintun/bin/amd64/wintun.dll
+          cd "$GITHUB_WORKSPACE"
+          go test -c -o "$RUNNER_TEMP/probe/candidate.exe" ./wgengine/router/osrouter
+      - name: Observe the unstarted router with real firewall rules
+        shell: pwsh
+        run: ./rehearsal-cleanup/probe.ps1 "$env:RUNNER_TEMP/probe/candidate.exe" before candidate
+      - name: Build the Windows-only correction
+        shell: bash
+        run: |
+          git apply rehearsal-cleanup/windows.guard.patch
+          go test -c -o "$RUNNER_TEMP/probe/guard.exe" ./wgengine/router/osrouter
+      - name: Check fresh and started routers
+        shell: pwsh
+        run: |
+          ./rehearsal-cleanup/probe.ps1 "$env:RUNNER_TEMP/probe/guard.exe" before guard
+          ./rehearsal-cleanup/probe.ps1 "$env:RUNNER_TEMP/probe/guard.exe" used guard

@@ -1,0 +1,59 @@
+diff --git a/wgengine/router/osrouter/router_windows.go b/wgengine/router/osrouter/router_windows.go
+index 3b32d5e014d26298b81542a30933829993355059..01bd9223bd71f7aa65b6d37e83cb3b34acaa885a 100644
+--- a/wgengine/router/osrouter/router_windows.go
++++ b/wgengine/router/osrouter/router_windows.go
+@@ -109,7 +109,7 @@ func hasDefaultRoute(routes []netip.Prefix) bool {
+ }
+ 
+ func (r *winRouter) Close() error {
+-	r.firewall.clear()
++	r.firewall.clearIfUsed()
+ 
+ 	if r.routeChangeCallback != nil {
+ 		r.routeChangeCallback.Unregister()
+@@ -161,6 +161,16 @@ type firewallTweaker struct {
+ 
+ func (ft *firewallTweaker) clear() { ft.set(nil, nil, nil) }
+ 
++// clearIfUsed only schedules a reset if this router has requested firewall
++// work. Starting a fresh worker would replace the host's inbound rules.
++func (ft *firewallTweaker) clearIfUsed() {
++	ft.mu.Lock()
++	defer ft.mu.Unlock()
++	if ft.running || ft.known {
++		ft.setLocked(nil, nil, nil)
++	}
++}
++
+ // set takes CIDRs to allow, and the routes that point into the Tailscale tun interface.
+ // Empty slices remove firewall rules.
+ //
+@@ -168,7 +178,10 @@ func (ft *firewallTweaker) clear() { ft.set(nil, nil, nil) }
+ func (ft *firewallTweaker) set(cidrs []string, routes, localRoutes []netip.Prefix) {
+ 	ft.mu.Lock()
+ 	defer ft.mu.Unlock()
++	ft.setLocked(cidrs, routes, localRoutes)
++}
+ 
++func (ft *firewallTweaker) setLocked(cidrs []string, routes, localRoutes []netip.Prefix) {
+ 	if len(cidrs) == 0 {
+ 		ft.logf("marking for removal")
+ 	} else {
+diff --git a/wgengine/router/osrouter/router_windows_test.go b/wgengine/router/osrouter/router_windows_test.go
+index abbbdf93b1fcbcfea7fd6de48d182032c4f5bf82..cb325c11492eee122b6eff3fe3368ec9460e472c 100644
+--- a/wgengine/router/osrouter/router_windows_test.go
++++ b/wgengine/router/osrouter/router_windows_test.go
+@@ -17,3 +17,13 @@ func TestGetNetshPath(t *testing.T) {
+ 		t.Errorf("expected absolute path for netsh.exe: %q", path)
+ 	}
+ }
++
++func TestCloseBeforeUpLeavesFirewallUnused(t *testing.T) {
++	r := &winRouter{firewall: &firewallTweaker{logf: func(format string, args ...any) {
++		// Fail on the synchronous request, before a worker can run netsh.
++		t.Fatalf(format, args...)
++	}}}
++	if err := r.Close(); err != nil {
++		t.Fatal(err)
++	}
++}
