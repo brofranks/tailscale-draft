@@ -21,7 +21,7 @@ jobs:
         run: |
           set -euo pipefail
           go install github.com/tailscale/tailcat/cmd/tailcat@52fbad323e9d352f1febb623e0975368e9a8cbdd
-          git apply rehearsal-cleanup/candidate.patch
+          git cat-file blob HEAD:rehearsal-cleanup/candidate.patch | git apply -
           cp rehearsal-cleanup/ownership_probe_windows_test.go wgengine/router/osrouter/
           mkdir -p "$RUNNER_TEMP/probe"
           curl --fail --silent --show-error --location https://www.wintun.net/builds/wintun-0.14.1.zip -o "$RUNNER_TEMP/probe/wintun.zip"
@@ -36,7 +36,7 @@ jobs:
       - name: Build the Windows-only correction
         shell: bash
         run: |
-          git apply rehearsal-cleanup/windows.guard.patch
+          git cat-file blob HEAD:rehearsal-cleanup/windows.guard.patch | git apply -
           go test -c -o "$RUNNER_TEMP/probe/guard.exe" ./wgengine/router/osrouter
       - name: Check fresh and started routers
         shell: pwsh
