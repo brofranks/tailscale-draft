@@ -22,7 +22,7 @@ try {
     $before = Snapshot
     if (@(ConvertFrom-Json $before).Count -ne 2) { throw 'sentinel rule setup failed' }
     $env:HEADWIRE_FIREWALL_PROBE = $Mode
-    & $Executable -test.v -test.run '^TestNativeFirewallOwnership$' -test.timeout 3m
+    & $Executable '-test.v' '-test.run=^TestNativeFirewallOwnership$' '-test.timeout=3m'
     if ($LASTEXITCODE -ne 0) { throw "Native probe failed: $LASTEXITCODE" }
     $after = Snapshot
     $preserved = $before -ceq $after
