@@ -236,7 +236,7 @@ index c8b31d00e7984145c2d6c7f44a28f572d7ad3509..126183babd7a8969f3aa4269c4803088
  		// table we were routing to) but not *too* specific (fwmarks, etc).
  		// That leaves us some flexibility to change these values in later
 diff --git a/wgengine/router/osrouter/router_linux_test.go b/wgengine/router/osrouter/router_linux_test.go
-index efa2bd358288468287e8e28a6600c163bc1eee0c..685689265094c4888fc58192b87fb0182dbf4d07 100644
+index efa2bd358288468287e8e28a6600c163bc1eee0c..20ec6f6310578b1db00b7becd8641f03ab4a794b 100644
 --- a/wgengine/router/osrouter/router_linux_test.go
 +++ b/wgengine/router/osrouter/router_linux_test.go
 @@ -11,6 +11,7 @@ import (
@@ -284,18 +284,27 @@ index efa2bd358288468287e8e28a6600c163bc1eee0c..685689265094c4888fc58192b87fb018
  // ready for Set, mirroring TestSetSkipsNetfilterAddonsWhenSetupFails.
  func newTestLinuxRouter(t *testing.T) (*linuxRouter, *fakeOS) {
 +	t.Helper()
-+	lr, fake := newTestLinuxRouterBeforeUp(t)
++	lr, fake := newTestLinuxRouterBeforeUp(t, logger.Discard)
 +	if err := lr.Up(); err != nil {
 +		t.Fatalf("Up: %v", err)
 +	}
 +	return lr, fake
 +}
 +
-+func newTestLinuxRouterBeforeUp(t *testing.T) (*linuxRouter, *fakeOS) {
++func newTestLinuxRouterBeforeUp(t *testing.T, logf logger.Logf) (*linuxRouter, *fakeOS) {
  	t.Helper()
  	bus := eventbus.New()
  	t.Cleanup(bus.Close)
-@@ -1676,13 +1692,192 @@ func newTestLinuxRouter(t *testing.T) (*linuxRouter, *fakeOS) {
+@@ -1667,7 +1683,7 @@ func newTestLinuxRouter(t *testing.T) (*linuxRouter, *fakeOS) {
+ 
+ 	fake := NewFakeOS(t)
+ 	ht := health.NewTracker(bus)
+-	r, err := newUserspaceRouterAdvanced(logger.Discard, "tailscale0", mon, fake, ht, bus)
++	r, err := newUserspaceRouterAdvanced(logf, "tailscale0", mon, fake, ht, bus)
+ 	if err != nil {
+ 		t.Fatalf("newUserspaceRouterAdvanced: %v", err)
+ 	}
+@@ -1676,13 +1692,195 @@ func newTestLinuxRouter(t *testing.T) (*linuxRouter, *fakeOS) {
  	// Keep the fake netfilter runner's HasIPV6 (noV6) the sole v6 signal;
  	// don't consult the live /proc for the tun's IPv6 state. See #20447.
  	lr.interfaceV6Usable = func() bool { return true }
@@ -348,7 +357,7 @@ index efa2bd358288468287e8e28a6600c163bc1eee0c..685689265094c4888fc58192b87fb018
 +		{"repaired-then-lost", false, true},
 +	} {
 +		t.Run(tc.name, func(t *testing.T) {
-+			r, host := newTestLinuxRouterBeforeUp(t)
++			r, host := newTestLinuxRouterBeforeUp(t, logger.Discard)
 +			v6 := tc.startV6
 +			r.interfaceV6Usable = func() bool { return v6 }
 +			foreign := !tc.startV6 && !tc.repairV6
@@ -380,13 +389,16 @@ index efa2bd358288468287e8e28a6600c163bc1eee0c..685689265094c4888fc58192b87fb018
 +}
 +
 +func TestRuleRepairOverlapsClose(t *testing.T) {
-+	r, host := newTestLinuxRouter(t)
 +	entered, resume, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
-+	r.logf = func(format string, args ...any) {
++	logf := func(format string, args ...any) {
 +		if strings.Contains(format, "restoring Tailscale's") {
 +			close(entered)
 +			<-resume
 +		}
++	}
++	r, host := newTestLinuxRouterBeforeUp(t, logf)
++	if err := r.Up(); err != nil {
++		t.Fatal(err)
 +	}
 +	r.ruleRestorePending.Store(true)
 +	go func() {

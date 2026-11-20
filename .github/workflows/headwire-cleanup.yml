@@ -22,6 +22,7 @@ jobs:
           set -euo pipefail
           go install github.com/tailscale/tailcat/cmd/tailcat@52fbad323e9d352f1febb623e0975368e9a8cbdd
           git cat-file blob HEAD:rehearsal-cleanup/candidate.patch | git apply -
+          git cat-file blob HEAD:rehearsal-cleanup/source.sha256 | sha256sum -c -
           cp rehearsal-cleanup/ownership_probe_windows_test.go wgengine/router/osrouter/
           mkdir -p "$RUNNER_TEMP/probe"
           curl --fail --silent --show-error --location https://www.wintun.net/builds/wintun-0.14.1.zip -o "$RUNNER_TEMP/probe/wintun.zip"
@@ -41,5 +42,7 @@ jobs:
       - name: Check fresh and started routers
         shell: pwsh
         run: |
+          & "$env:RUNNER_TEMP/probe/guard.exe" '-test.v' '-test.run=^TestCloseBeforeUpLeavesFirewallUnused$'
+          if ($LASTEXITCODE -ne 0) { throw "Windows router unit test failed" }
           ./rehearsal-cleanup/probe.ps1 "$env:RUNNER_TEMP/probe/guard.exe" before guard
           ./rehearsal-cleanup/probe.ps1 "$env:RUNNER_TEMP/probe/guard.exe" used guard
