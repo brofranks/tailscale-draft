@@ -34,6 +34,7 @@ import (
 	"tailscale.com/net/packet"
 	"tailscale.com/net/packet/checksum"
 	"tailscale.com/net/routemanager"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/tstest"
 	"tailscale.com/tstime/mono"
 	"tailscale.com/types/ipproto"
@@ -1373,5 +1374,38 @@ func TestStackGSOToTunGSO(t *testing.T) {
 				t.Errorf("mismatch (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+func TestServiceAddressEchoPassesThrough(t *testing.T) {
+	_, tun := newFakeTUN(t.Logf, eventbustest.NewBus(t), false)
+	defer tun.Close()
+	tun.SetFilter(filter.NewAllowAllForTest(t.Logf))
+	for _, tc := range []struct {
+		src string
+		dst netip.Addr
+	}{
+		{"100.64.0.1", tsaddr.TailscaleServiceIP()},
+		{"fd7a:115c:a1e0::1", tsaddr.TailscaleServiceIPv6()},
+	} {
+		src := netip.MustParseAddr(tc.src)
+		var h packet.Header = &packet.ICMP4Header{
+			IP4Header: packet.IP4Header{IPProto: ipproto.ICMPv4, Src: src, Dst: tc.dst},
+			Type:      packet.ICMP4EchoRequest,
+		}
+		if tc.dst.Is6() {
+			h = &packet.ICMP6Header{
+				IP6Header: packet.IP6Header{IPProto: ipproto.ICMPv6, Src: src, Dst: tc.dst},
+				Type:      packet.ICMP6EchoRequest,
+			}
+		}
+		p := new(packet.Parsed)
+		p.Decode(packet.Generate(h, make([]byte, 4))) // identifier and sequence
+		if !p.IsEchoRequest() {
+			t.Fatalf("not an echo request: %v", p)
+		}
+		if got, _ := tun.filterPacketOutboundToWireGuard(p, nil, nil); got != filter.Accept {
+			t.Errorf("%v: filter response = %v, want %v", tc.dst, got, filter.Accept)
+		}
 	}
 }

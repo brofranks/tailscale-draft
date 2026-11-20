@@ -744,30 +744,7 @@ func (t *Wrapper) SetPeerRoutes(native4, native6 netip.Addr, routes *bart.Table[
 	}
 }
 
-var (
-	magicDNSIPPort   = netip.AddrPortFrom(tsaddr.TailscaleServiceIP(), 0) // 100.100.100.100:0
-	magicDNSIPPortv6 = netip.AddrPortFrom(tsaddr.TailscaleServiceIPv6(), 0)
-)
-
 func (t *Wrapper) filterPacketOutboundToWireGuard(p *packet.Parsed, pc *peerConfigTable, gro *gro.GRO) (filter.Response, *gro.GRO) {
-	// Fake ICMP echo responses to MagicDNS (100.100.100.100).
-	if p.IsEchoRequest() {
-		switch p.Dst {
-		case magicDNSIPPort:
-			header := p.ICMP4Header()
-			header.ToResponse()
-			outp := packet.Generate(&header, p.Payload())
-			t.InjectInboundCopy(outp)
-			return filter.DropSilently, gro // don't pass on to OS; already handled
-		case magicDNSIPPortv6:
-			header := p.ICMP6Header()
-			header.ToResponse()
-			outp := packet.Generate(&header, p.Payload())
-			t.InjectInboundCopy(outp)
-			return filter.DropSilently, gro // don't pass on to OS; already handled
-		}
-	}
-
 	// TSMP traffic should only originate from tailscaled, not from the host
 	// itself.
 	if p.IPProto == ipproto.TSMP {
