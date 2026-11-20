@@ -1,3 +1,13 @@
 fork-ci.patch
 netmon-registered-interface.patch
 magicsock-callmemaybe.patch
+tstun-service-echo.patch
+magicsock-local-endpoint-ports.patch
+netmon-tunnel-registration.patch
+netmon-underlay-endpoints.patch
+netmon-linux-address-events.patch
+netns-registered-interface.patch
+netmon-darwin-path-withdrawal.patch
+dns-listener-ownership.patch
+dns-explicit-records.patch
+osrouter-windows-local-routes.patch

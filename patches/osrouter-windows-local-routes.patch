@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <noreply@openai.com>
+Date: Thu, 19 Nov 2026 13:58:47 -0800
+Subject: [PATCH] wgengine/router/osrouter: keep Windows subnet routes at local
+ addresses
+
+The kernel supplies a host route for each assigned IP. A subnet with
+that IP as its base still needs a route, as do hosts beyond the
+interface addresses. Keep the established Windows next-hop rules.
+---
+ wgengine/router/osrouter/ifconfig_windows.go | 13 +++---------
+ wgengine/router/osrouter/osrouter.go         | 15 +++++++++++++-
+ wgengine/router/osrouter/osrouter_test.go    | 21 +++++++++++++++++++-
+ 3 files changed, 37 insertions(+), 12 deletions(-)
+
+diff --git a/wgengine/router/osrouter/ifconfig_windows.go b/wgengine/router/osrouter/ifconfig_windows.go
+index d24fe97900aed16cecb5a3c4df78ba4479fd5cea..1bcc642496ab956d1ae372eb42bc55f2f7cf6a83 100644
+--- a/wgengine/router/osrouter/ifconfig_windows.go
++++ b/wgengine/router/osrouter/ifconfig_windows.go
+@@ -336,7 +336,6 @@ func configureInterface(cfg *router.Config, tun *tun.NativeTun, ht *health.Track
+ 	// routes from being marked as on-link. We can still create on-link routes
+ 	// for single-host Tailscale routes, but we shouldn't attempt to create a
+ 	// route for the interface's own IP.
+-	var localAddr4, localAddr6 netip.Addr
+ 	var gatewayAddr4, gatewayAddr6 netip.Addr
+ 	addresses := make([]netip.Prefix, 0, len(cfg.LocalAddrs))
+ 	for _, addr := range cfg.LocalAddrs {
+@@ -346,10 +345,8 @@ func configureInterface(cfg *router.Config, tun *tun.NativeTun, ht *health.Track
+ 		}
+ 		addresses = append(addresses, addr)
+ 		if addr.Addr().Is4() && !gatewayAddr4.IsValid() {
+-			localAddr4 = addr.Addr()
+ 			gatewayAddr4 = tsaddr.TailscaleServiceIP()
+ 		} else if addr.Addr().Is6() && !gatewayAddr6.IsValid() {
+-			localAddr6 = addr.Addr()
+ 			gatewayAddr6 = tsaddr.TailscaleServiceIPv6()
+ 		}
+ 	}
+@@ -378,17 +375,13 @@ func configureInterface(cfg *router.Config, tun *tun.NativeTun, ht *health.Track
+ 			return errors.New("due to a Windows limitation, one cannot have interface routes without an interface address")
+ 		}
+ 
+-		var gateway, localAddr netip.Addr
+-		if route.Addr().Is4() {
+-			localAddr = localAddr4
+-			gateway = gatewayAddr4
+-		} else if route.Addr().Is6() {
+-			localAddr = localAddr6
++		gateway := gatewayAddr4
++		if route.Addr().Is6() {
+ 			gateway = gatewayAddr6
+ 		}
+ 
+ 		switch destAddr := route.Addr().Unmap(); {
+-		case destAddr == localAddr:
++		case isLocalHostRoute(route, addresses):
+ 			// no need to add a route for the interface's
+ 			// own IP. The kernel does that for us.
+ 			// If we try to replace it, we'll fail to
+diff --git a/wgengine/router/osrouter/osrouter.go b/wgengine/router/osrouter/osrouter.go
+index ac4e48c7268c7d95769ae772a0baa9afece01a93..33d7da88d56d1f3da800db16594bceced5f784e5 100644
+--- a/wgengine/router/osrouter/osrouter.go
++++ b/wgengine/router/osrouter/osrouter.go
+@@ -7,9 +7,22 @@
+ // package.
+ package osrouter
+ 
+-import "tailscale.com/wgengine/router"
++import (
++	"net/netip"
++	"slices"
++
++	"tailscale.com/wgengine/router"
++)
+ 
+ // shutdownConfig is a routing configuration that removes all router
+ // state from the OS. It's the config used when callers pass in a nil
+ // Config.
+ var shutdownConfig router.Config
++
++// isLocalHostRoute reports whether the kernel already supplies the host route
++// for an address assigned to the adapter.
++func isLocalHostRoute(route netip.Prefix, assigned []netip.Prefix) bool {
++	return route.IsSingleIP() && slices.ContainsFunc(assigned, func(p netip.Prefix) bool {
++		return p.Addr().Unmap() == route.Addr().Unmap()
++	})
++}
+diff --git a/wgengine/router/osrouter/osrouter_test.go b/wgengine/router/osrouter/osrouter_test.go
+index 5e81d6297d035b38bb58e4b1ceaf186ba1b20e70..185348f259c8d72149c0c15700468d85656cc707 100644
+--- a/wgengine/router/osrouter/osrouter_test.go
++++ b/wgengine/router/osrouter/osrouter_test.go
+@@ -3,7 +3,10 @@
+ 
+ package osrouter
+ 
+-import "net/netip"
++import (
++	"net/netip"
++	"testing"
++)
+ 
+ //lint:ignore U1000 used in Windows/Linux tests only
+ func mustCIDRs(ss ...string) []netip.Prefix {
+@@ -13,3 +16,19 @@ func mustCIDRs(ss ...string) []netip.Prefix {
+ 	}
+ 	return ret
+ }
++
++func TestIsLocalHostRoute(t *testing.T) {
++	assigned := mustCIDRs("fd42::10/128", "fd42::21/64", "10.0.0.16/32", "10.0.0.17/32")
++	for _, tc := range []struct {
++		prefix string
++		skip   bool
++	}{
++		{"fd42::10/124", false}, {"fd42::10/128", true}, {"fd42::21/128", true},
++		{"fd42::22/128", false}, {"10.0.0.16/28", false}, {"10.0.0.17/32", true},
++		{"100.100.100.100/32", false}, {"::/0", false},
++	} {
++		if got := isLocalHostRoute(netip.MustParsePrefix(tc.prefix), assigned); got != tc.skip {
++			t.Errorf("skip %s = %v, want %v", tc.prefix, got, tc.skip)
++		}
++	}
++}

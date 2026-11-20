@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <noreply@openai.com>
+Date: Thu, 19 Nov 2026 13:58:46 -0800
+Subject: [PATCH] net/netmon: identify Linux tunnel address events by interface
+
+An add-only CGNAT address change on a physical LAN can leave the
+interface snapshot stale. Suppress notifications only for the known
+tunnel index so underlay additions and deletions reach the monitor.
+---
+ net/netmon/netmon_linux.go      |  3 ++-
+ net/netmon/netmon_linux_test.go | 18 ++++++++++++++++++
+ 2 files changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/net/netmon/netmon_linux.go b/net/netmon/netmon_linux.go
+index b7d87f995634fa1a42595e5fc811edf913c98174..28d8850e896c0dad1743291cbb03b711c57e1c3d 100644
+--- a/net/netmon/netmon_linux.go
++++ b/net/netmon/netmon_linux.go
+@@ -303,7 +303,8 @@ type newAddrMessage struct {
+ }
+ 
+ func (m *newAddrMessage) ignore() bool {
+-	return tsaddr.IsTailscaleIP(m.Addr)
++	index := tsIfProps.tsIfIndex()
++	return index > 0 && uint32(index) == m.IfIndex
+ }
+ 
+ type ignoreMessage struct{}
+diff --git a/net/netmon/netmon_linux_test.go b/net/netmon/netmon_linux_test.go
+index c4e59059ac4c43efe5c55e629f30f01819581d20..4a1ef2b5282013b98b29a8f54b82549d0cb3c4ed 100644
+--- a/net/netmon/netmon_linux_test.go
++++ b/net/netmon/netmon_linux_test.go
+@@ -99,3 +99,21 @@ func TestIgnoreDuplicateNEWADDR(t *testing.T) {
+ 		}
+ 	})
+ }
++
++func TestTunnelAddressEvents(t *testing.T) {
++	oldName, oldIndex := tsIfProps.tsIfName(), tsIfProps.tsIfIndex()
++	t.Cleanup(func() { tsIfProps.set(oldName, oldIndex) })
++	for _, index := range []int{0, 7} {
++		tsIfProps.set("wg0", index)
++		for _, ifIndex := range []uint32{7, 8} {
++			for _, addr := range []string{"100.70.1.4", "10.22.3.5", "fd7a:115c:a1e0::9"} {
++				for _, del := range []bool{false, true} {
++					msg := newAddrMessage{IfIndex: ifIndex, Addr: netip.MustParseAddr(addr), Delete: del}
++					if got, want := msg.ignore(), index == int(ifIndex); got != want {
++						t.Errorf("index=%d message=%+v ignore=%v, want %v", index, msg, got, want)
++					}
++				}
++			}
++		}
++	}
++}

@@ -1,0 +1,190 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <noreply@openai.com>
+Date: Thu, 19 Nov 2026 14:14:52 -0800
+Subject: [PATCH] net/dns/resolver: confine synthetic DNS answers to MagicDNS
+
+Consult MagicDNS synthesis only with an installed MagicDNS host source.
+Give configured names and exact reverse records precedence, and forward
+otherwise unmatched queries for generic resolvers.
+---
+ net/dns/resolver/tsdns.go      | 56 ++++++++++++++++----------------
+ net/dns/resolver/tsdns_test.go | 58 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 85 insertions(+), 29 deletions(-)
+
+diff --git a/net/dns/resolver/tsdns.go b/net/dns/resolver/tsdns.go
+index 60ad943f3a452929c361c4485d393d1c0f4686af..10f05b3bd0273d76de92a29b5ee8705981c853e7 100644
+--- a/net/dns/resolver/tsdns.go
++++ b/net/dns/resolver/tsdns.go
+@@ -291,7 +291,8 @@ type MagicDNSHosts interface {
+ // SetMagicDNSHosts installs the live MagicDNS host source consulted
+ // by forward and reverse MagicDNS lookups that miss [Config.Hosts].
+ // It is expected to be called once, before the resolver serves
+-// queries.
++// queries. Installing a source also enables MagicDNS service and 4via6 aliases
++// for names and addresses without an explicit record.
+ func (r *Resolver) SetMagicDNSHosts(h MagicDNSHosts) {
+ 	if !buildfeatures.HasDNS {
+ 		return
+@@ -726,22 +727,6 @@ func (r *Resolver) resolveLocal(domain dnsname.FQDN, typ dns.Type) (netip.Addr,
+ 		return netip.Addr{}, dns.RCodeNameError
+ 	}
+ 
+-	// We return a symbolic domain if someone does a reverse lookup on the
+-	// DNS endpoint. To round out this special case, we also do the inverse
+-	// (returning the endpoint IP if someone looks up the symbolic domain).
+-	if domain == dnsSymbolicFQDN {
+-		switch typ {
+-		case dns.TypeA:
+-			return tsaddr.TailscaleServiceIP(), dns.RCodeSuccess
+-		case dns.TypeAAAA:
+-			return tsaddr.TailscaleServiceIPv6(), dns.RCodeSuccess
+-		}
+-	}
+-	// Special-case: 4via6 DNS names.
+-	if ip, ok := r.resolveViaDomain(domain, typ); ok {
+-		return ip, dns.RCodeSuccess
+-	}
+-
+ 	r.mu.Lock()
+ 	hosts := r.hostToIP
+ 	localDomains := r.localDomains
+@@ -751,6 +736,21 @@ func (r *Resolver) resolveLocal(domain dnsname.FQDN, typ dns.Type) (netip.Addr,
+ 
+ 	addrs, found := hosts[domain]
+ 	if !found && magicHosts != nil {
++		// We return a symbolic domain if someone does a reverse lookup on the
++		// DNS endpoint. To round out this special case, we also do the inverse
++		// (returning the endpoint IP if someone looks up the symbolic domain).
++		if domain == dnsSymbolicFQDN {
++			switch typ {
++			case dns.TypeA:
++				return tsaddr.TailscaleServiceIP(), dns.RCodeSuccess
++			case dns.TypeAAAA:
++				return tsaddr.TailscaleServiceIPv6(), dns.RCodeSuccess
++			}
++		}
++		// Special-case: 4via6 DNS names.
++		if ip, ok := r.resolveViaDomain(domain, typ); ok {
++			return ip, dns.RCodeSuccess
++		}
+ 		addrs, found = magicHosts.LookupHost(domain)
+ 	}
+ 	if !found {
+@@ -917,10 +917,12 @@ func (r *Resolver) resolveLocalReverse(name dnsname.FQDN) (dnsname.FQDN, dns.RCo
+ 
+ 	// If the requested IP is part of the IPv6 4-to-6 range, it might
+ 	// correspond to an IPv4 address (assuming IPv4 is enabled).
+-	if ip4, ok := tsaddr.Tailscale6to4(ip); ok {
+-		fqdn, code := r.fqdnForIPLocked(ip4, name)
+-		if code == dns.RCodeSuccess {
+-			return fqdn, code
++	if _, exact := r.ipToHost[ip]; !exact && r.magicHosts != nil {
++		if ip4, ok := tsaddr.Tailscale6to4(ip); ok {
++			fqdn, code := r.fqdnForIPLocked(ip4, name)
++			if code == dns.RCodeSuccess {
++				return fqdn, code
++			}
+ 		}
+ 	}
+ 	return r.fqdnForIPLocked(ip, name)
+@@ -928,16 +930,12 @@ func (r *Resolver) resolveLocalReverse(name dnsname.FQDN) (dnsname.FQDN, dns.RCo
+ 
+ // r.mu must be held.
+ func (r *Resolver) fqdnForIPLocked(ip netip.Addr, name dnsname.FQDN) (dnsname.FQDN, dns.RCode) {
+-	// If someone curiously does a reverse lookup on the DNS IP, we
+-	// return a domain that helps indicate that Tailscale is using
+-	// this IP for a special purpose and it is not a node on their
+-	// tailnet.
+-	if ip == tsaddr.TailscaleServiceIP() || ip == tsaddr.TailscaleServiceIPv6() {
+-		return dnsSymbolicFQDN, dns.RCodeSuccess
+-	}
+-
+ 	ret, ok := r.ipToHost[ip]
+ 	if !ok && r.magicHosts != nil {
++		// The reverse of a MagicDNS service address names the daemon.
++		if ip == tsaddr.TailscaleServiceIP() || ip == tsaddr.TailscaleServiceIPv6() {
++			return dnsSymbolicFQDN, dns.RCodeSuccess
++		}
+ 		ret, ok = r.magicHosts.LookupPTR(ip)
+ 	}
+ 	if !ok {
+diff --git a/net/dns/resolver/tsdns_test.go b/net/dns/resolver/tsdns_test.go
+index 5a4630aff6fdc564f1fc0561337553c643fba982..435d0287c5161c810ea20f0c6656f220160a9475 100644
+--- a/net/dns/resolver/tsdns_test.go
++++ b/net/dns/resolver/tsdns_test.go
+@@ -369,6 +369,7 @@ func newResolver(t testing.TB) *Resolver {
+ 
+ func TestResolveLocal(t *testing.T) {
+ 	r := newResolver(t)
++	r.SetMagicDNSHosts(fakeMagicDNSHosts{})
+ 	defer r.Close()
+ 
+ 	r.SetConfig(dnsCfg)
+@@ -585,6 +586,7 @@ func TestResolveLocalMagicDNSHosts(t *testing.T) {
+ 
+ func TestResolveLocalReverse(t *testing.T) {
+ 	r := newResolver(t)
++	r.SetMagicDNSHosts(fakeMagicDNSHosts{})
+ 	defer r.Close()
+ 
+ 	r.SetConfig(dnsCfg)
+@@ -1863,3 +1865,59 @@ func TestLocalResponseTCFlagIntegration(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestExplicitDNSRecords(t *testing.T) {
++	r := newResolver(t)
++	defer r.Close()
++	const via = "192-0-2-1-via-1."
++	v6 := netip.MustParseAddr("fd7a:115c:a1e0:ab12:4843:cd96:6246:109")
++	v4 := netip.MustParseAddr("100.70.1.9")
++	custom := netip.MustParseAddr("fd42::8")
++	testHosts := map[dnsname.FQDN][]netip.Addr{
++		dnsSymbolicFQDN: {custom}, via: {netip.MustParseAddr("fd42::9")},
++		"v6.example.": {v6}, "v4.example.": {v4},
++		"resolver.example.": {netip.MustParseAddr("100.100.100.100")},
++	}
++	if err := r.SetConfig(Config{Hosts: testHosts}); err != nil {
++		t.Fatal(err)
++	}
++	for _, useMagic := range []bool{false, true} {
++		if useMagic {
++			r.SetMagicDNSHosts(fakeMagicDNSHosts{})
++		}
++		for _, name := range []dnsname.FQDN{dnsSymbolicFQDN, via} {
++			if ip, code := r.resolveLocal(name, dns.TypeAAAA); code != dns.RCodeSuccess || ip != testHosts[name][0] {
++				t.Errorf("%s = %v, %v", name, ip, code)
++			}
++		}
++		for _, name := range []dnsname.FQDN{"v6.example.", "resolver.example."} {
++			arpa, err := miekdns.ReverseAddr(testHosts[name][0].String())
++			if err != nil {
++				t.Fatal(err)
++			}
++			if got, code := r.resolveLocalReverse(dnsname.FQDN(arpa)); code != dns.RCodeSuccess || got != name {
++				t.Errorf("PTR %s = %s, %v, want %s", arpa, got, code, name)
++			}
++		}
++	}
++	r.SetMagicDNSHosts(nil)
++	if err := r.SetConfig(Config{}); err != nil {
++		t.Fatal(err)
++	}
++	for _, name := range []dnsname.FQDN{dnsSymbolicFQDN, via} {
++		for _, typ := range []dns.Type{dns.TypeA, dns.TypeAAAA} {
++			if _, code := r.resolveLocal(name, typ); code != dns.RCodeRefused {
++				t.Errorf("%s %v: got %v, want forwarding", name, typ, code)
++			}
++		}
++	}
++	for _, ip := range []string{"100.100.100.100", "fd7a:115c:a1e0::53", v6.String()} {
++		arpa, err := miekdns.ReverseAddr(ip)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if name, code := r.resolveLocalReverse(dnsname.FQDN(arpa)); code != dns.RCodeRefused {
++			t.Errorf("PTR %v = %q, %v, want forwarding", ip, name, code)
++		}
++	}
++}

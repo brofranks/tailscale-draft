@@ -1,0 +1,192 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <noreply@openai.com>
+Date: Thu, 19 Nov 2026 13:58:46 -0800
+Subject: [PATCH] wgengine/magicsock: advertise the bound UDP port for each
+ family
+
+IPv4 and IPv6 listeners can have different ports, including with the
+default automatic port. Pair local addresses with their own listener for
+wildcard and specific binds, and skip unbound families.
+---
+ wgengine/magicsock/magicsock.go      | 68 ++++++++++++++++++----------
+ wgengine/magicsock/magicsock_test.go | 66 +++++++++++++++++++++++++++
+ 2 files changed, 110 insertions(+), 24 deletions(-)
+
+diff --git a/wgengine/magicsock/magicsock.go b/wgengine/magicsock/magicsock.go
+index d68f60d938e5ba98e9524e6b4cd8ab1b3feca668..748f42643bbcdbe84fe13f1566133349f4adc9c7 100644
+--- a/wgengine/magicsock/magicsock.go
++++ b/wgengine/magicsock/magicsock.go
+@@ -1308,10 +1308,6 @@ func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, erro
+ 	var already map[netip.AddrPort]tailcfg.EndpointType // endpoint -> how it was found
+ 	var eps []tailcfg.Endpoint                          // unique endpoints
+ 
+-	ipp := func(s string) (ipp netip.AddrPort) {
+-		ipp, _ = netip.ParseAddrPort(s)
+-		return
+-	}
+ 	addAddr := func(ipp netip.AddrPort, et tailcfg.EndpointType) {
+ 		if !ipp.IsValid() || (debugOmitLocalAddresses() && et == tailcfg.EndpointLocal) {
+ 			return
+@@ -1403,26 +1399,12 @@ func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, erro
+ 		addAddr(ep, tailcfg.EndpointExplicitConf)
+ 	}
+ 
+-	if localAddr := c.pconn4.LocalAddr(); localAddr.IP.IsUnspecified() {
+-		ips, loopback, err := netmon.LocalAddresses()
+-		if err != nil {
+-			return nil, err
+-		}
+-		if len(ips) == 0 && len(eps) == 0 {
+-			// Only include loopback addresses if we have no
+-			// interfaces at all to use as endpoints and don't
+-			// have a public IPv4 or IPv6 address. This allows
+-			// for localhost testing when you're on a plane and
+-			// offline, for example.
+-			ips = loopback
+-		}
+-		for _, ip := range ips {
+-			addAddr(netip.AddrPortFrom(ip, uint16(localAddr.Port)), tailcfg.EndpointLocal)
+-		}
+-	} else {
+-		// Our local endpoint is bound to a particular address.
+-		// Do not offer addresses on other local interfaces.
+-		addAddr(ipp(localAddr.String()), tailcfg.EndpointLocal)
++	local, err := c.localEndpoints(len(eps) > 0)
++	if err != nil {
++		return nil, err
++	}
++	for _, ep := range local {
++		addAddr(ep, tailcfg.EndpointLocal)
+ 	}
+ 
+ 	// Note: the endpoints are intentionally returned in priority order,
+@@ -1473,6 +1455,44 @@ func endpointSetsEqual(x, y []tailcfg.Endpoint) bool {
+ 	return true
+ }
+ 
++// localEndpoints pairs each eligible address with the socket bound for its family.
++func (c *Conn) localEndpoints(haveOther bool) ([]netip.AddrPort, error) {
++	v4 := c.pconn4.LocalAddr().AddrPort()
++	v6 := c.pconn6.LocalAddr().AddrPort()
++	var eps []netip.AddrPort
++	for _, bound := range []netip.AddrPort{v4, v6} {
++		if bound.Port() != 0 && !bound.Addr().Unmap().IsUnspecified() {
++			eps = append(eps, netip.AddrPortFrom(bound.Addr().Unmap(), bound.Port()))
++		}
++	}
++	wildcard := func(ap netip.AddrPort) bool {
++		return ap.Port() != 0 && ap.Addr().Unmap().IsUnspecified()
++	}
++	if wildcard(v4) || wildcard(v6) {
++		ips, loopback, err := netmon.LocalAddresses()
++		if err != nil {
++			return nil, err
++		}
++		add := func(ips []netip.Addr) {
++			for _, ip := range ips {
++				bound := v6
++				if ip.Is4() {
++					bound = v4
++				}
++				if wildcard(bound) {
++					eps = append(eps, netip.AddrPortFrom(ip, bound.Port()))
++				}
++			}
++		}
++		add(ips)
++		// Offline peers can still find each other on loopback.
++		if len(eps) == 0 && !haveOther {
++			add(loopback)
++		}
++	}
++	return eps, nil
++}
++
+ // LocalPort returns the current IPv4 listener's port number.
+ func (c *Conn) LocalPort() uint16 {
+ 	if runtime.GOOS == "js" {
+diff --git a/wgengine/magicsock/magicsock_test.go b/wgengine/magicsock/magicsock_test.go
+index 2275d2bc240df86dec1bb93c4804fcbc5b616bf4..3aa971ec50b29d5cb81bdce70e2385a3b48b3ceb 100644
+--- a/wgengine/magicsock/magicsock_test.go
++++ b/wgengine/magicsock/magicsock_test.go
+@@ -1365,10 +1365,12 @@ func testTwoDevicePing(t *testing.T, d *devices) {
+ 	addrPort := netip.MustParseAddrPort
+ 	m1Conns := []netlogtype.Connection{
+ 		{Src: addrPort("1.0.0.2:0"), Dst: m2.conn.pconn4.LocalAddr().AddrPort()},
++		{Src: addrPort("1.0.0.2:0"), Dst: m2.conn.pconn6.LocalAddr().AddrPort()},
+ 		{Src: addrPort("1.0.0.2:0"), Dst: addrPort("127.3.3.40:1")},
+ 	}
+ 	m2Conns := []netlogtype.Connection{
+ 		{Src: addrPort("1.0.0.1:0"), Dst: m1.conn.pconn4.LocalAddr().AddrPort()},
++		{Src: addrPort("1.0.0.1:0"), Dst: m1.conn.pconn6.LocalAddr().AddrPort()},
+ 		{Src: addrPort("1.0.0.1:0"), Dst: addrPort("127.3.3.40:1")},
+ 	}
+ 
+@@ -5011,3 +5013,67 @@ func TestUnambiguousNodeKeyOfPingLocked(t *testing.T) {
+ 		}
+ 	})
+ }
++
++type localEndpointTestSocket struct {
++	*blockForeverConn
++	addr *net.UDPAddr
++}
++
++func (s localEndpointTestSocket) LocalAddr() net.Addr { return s.addr }
++
++func TestLocalEndpointPorts(t *testing.T) {
++	ip4 := netip.MustParseAddr("192.0.2.9")
++	ip6 := netip.MustParseAddr("2001:db8::9")
++	host := func(ip netip.Addr) net.Addr {
++		return &net.IPNet{IP: ip.AsSlice(), Mask: net.CIDRMask(ip.BitLen(), ip.BitLen())}
++	}
++	lan := netmon.Interface{Interface: &net.Interface{Name: "lan", Flags: net.FlagUp}, AltAddrs: []net.Addr{host(ip4), host(ip6)}}
++	lo := netmon.Interface{Interface: &net.Interface{Name: "lo", Flags: net.FlagUp | net.FlagLoopback},
++		AltAddrs: []net.Addr{host(netip.MustParseAddr("127.0.0.1")), host(netip.IPv6Loopback())}}
++	ifs := []netmon.Interface{lan, lo}
++	netmon.RegisterInterfaceGetter(func() ([]netmon.Interface, error) { return ifs, nil })
++	t.Cleanup(func() { netmon.RegisterInterfaceGetter(nil) })
++	for _, tc := range []struct {
++		name               string
++		v4, v6             string
++		offline, haveOther bool
++		want               []string
++	}{
++		{"separate-ports", "0.0.0.0:40101", "[::]:40202", false, false, []string{"192.0.2.9:40101", "[2001:db8::9]:40202"}},
++		{"fixed-v4", "192.0.2.8:40101", "[::]:40202", false, false, []string{"192.0.2.8:40101", "[2001:db8::9]:40202"}},
++		{"fixed-v6", "0.0.0.0:40101", "[2001:db8::8]:40202", false, false, []string{"192.0.2.9:40101", "[2001:db8::8]:40202"}},
++		{"missing-v4", "", "[::]:40202", false, false, []string{"[2001:db8::9]:40202"}},
++		{"missing-v6", "0.0.0.0:40101", "", false, false, []string{"192.0.2.9:40101"}},
++		{"offline", "0.0.0.0:40101", "[::]:40202", true, false, []string{"127.0.0.1:40101", "[::1]:40202"}},
++		{"public-endpoint", "0.0.0.0:40101", "[::]:40202", true, true, nil},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			if tc.offline {
++				ifs = []netmon.Interface{lo}
++			} else {
++				ifs = []netmon.Interface{lan, lo}
++			}
++			socket := func(s string) localEndpointTestSocket {
++				addr := new(net.UDPAddr)
++				if s != "" {
++					addr = net.UDPAddrFromAddrPort(netip.MustParseAddrPort(s))
++				}
++				return localEndpointTestSocket{addr: addr}
++			}
++			var c Conn
++			c.pconn4.pconn, c.pconn6.pconn = socket(tc.v4), socket(tc.v6)
++			got, err := c.localEndpoints(tc.haveOther)
++			if err != nil {
++				t.Fatal(err)
++			}
++			var ss []string
++			for _, ep := range got {
++				ss = append(ss, ep.String())
++			}
++			slices.Sort(ss)
++			if !slices.Equal(ss, tc.want) {
++				t.Errorf("local endpoints = %v, want %v", ss, tc.want)
++			}
++		})
++	}
++}

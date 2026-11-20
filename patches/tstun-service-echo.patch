@@ -1,0 +1,175 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brody Franks <brody@franks.id.au>
+Date: Thu, 19 Nov 2026 10:23:15 -0800
+Subject: [PATCH] net/tstun,tsd: answer echo only for configured service
+ addresses
+
+Let the daemon supply the destinations for local ICMP echo replies. An
+embedding that owns no service address can route both former service IPs
+to a WireGuard peer, including through a subnet or default route.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Brody Franks <brody@franks.id.au>
+---
+ net/tstun/wrap.go      | 36 +++++++++++++----------------
+ net/tstun/wrap_test.go | 51 ++++++++++++++++++++++++++++++++++++++++++
+ tsd/tsd.go             |  3 +++
+ 3 files changed, 70 insertions(+), 20 deletions(-)
+
+diff --git a/net/tstun/wrap.go b/net/tstun/wrap.go
+index a29b02c07140a9df5521a1eeda6fe36ea35ba0a0..c9f7e604b987b5f7fe2565bb8984be3a43a63f39 100644
+--- a/net/tstun/wrap.go
++++ b/net/tstun/wrap.go
+@@ -198,6 +198,10 @@ type Wrapper struct {
+ 	// PostFilterPacketOutboundToWireGuard is the outbound filter function that runs after the main filter.
+ 	PostFilterPacketOutboundToWireGuard FilterFunc
+ 
++	// ServiceEchoAddrs are the destinations for which the wrapper answers
++	// local ICMP echo requests. Set before Start.
++	ServiceEchoAddrs []netip.Addr
++
+ 	// OnTSMPPongReceived, if non-nil, is called whenever a TSMP pong arrives.
+ 	OnTSMPPongReceived func(packet.TSMPPongReply)
+ 
+@@ -744,28 +748,20 @@ func (t *Wrapper) SetPeerRoutes(native4, native6 netip.Addr, routes *bart.Table[
+ 	}
+ }
+ 
+-var (
+-	magicDNSIPPort   = netip.AddrPortFrom(tsaddr.TailscaleServiceIP(), 0) // 100.100.100.100:0
+-	magicDNSIPPortv6 = netip.AddrPortFrom(tsaddr.TailscaleServiceIPv6(), 0)
+-)
+-
+ func (t *Wrapper) filterPacketOutboundToWireGuard(p *packet.Parsed, pc *peerConfigTable, gro *gro.GRO) (filter.Response, *gro.GRO) {
+-	// Fake ICMP echo responses to MagicDNS (100.100.100.100).
+-	if p.IsEchoRequest() {
+-		switch p.Dst {
+-		case magicDNSIPPort:
+-			header := p.ICMP4Header()
+-			header.ToResponse()
+-			outp := packet.Generate(&header, p.Payload())
+-			t.InjectInboundCopy(outp)
+-			return filter.DropSilently, gro // don't pass on to OS; already handled
+-		case magicDNSIPPortv6:
+-			header := p.ICMP6Header()
+-			header.ToResponse()
+-			outp := packet.Generate(&header, p.Payload())
+-			t.InjectInboundCopy(outp)
+-			return filter.DropSilently, gro // don't pass on to OS; already handled
++	if p.IsEchoRequest() && slices.Contains(t.ServiceEchoAddrs, p.Dst.Addr()) {
++		var response packet.Header
++		if p.IPVersion == 4 {
++			h := p.ICMP4Header()
++			h.ToResponse()
++			response = &h
++		} else {
++			h := p.ICMP6Header()
++			h.ToResponse()
++			response = &h
+ 		}
++		t.InjectInboundCopy(packet.Generate(response, p.Payload()))
++		return filter.DropSilently, gro
+ 	}
+ 
+ 	// TSMP traffic should only originate from tailscaled, not from the host
+diff --git a/net/tstun/wrap_test.go b/net/tstun/wrap_test.go
+index 2b92b5a37562cad1f86fd8a479505059a2f63703..d0aab50124fd29550a47a4e75392c0c1e8b0e183 100644
+--- a/net/tstun/wrap_test.go
++++ b/net/tstun/wrap_test.go
+@@ -13,6 +13,7 @@
+ 	"fmt"
+ 	"net/netip"
+ 	"reflect"
++	"slices"
+ 	"strconv"
+ 	"strings"
+ 	"testing"
+@@ -34,6 +35,7 @@
+ 	"tailscale.com/net/packet"
+ 	"tailscale.com/net/packet/checksum"
+ 	"tailscale.com/net/routemanager"
++	"tailscale.com/net/tsaddr"
+ 	"tailscale.com/tstest"
+ 	"tailscale.com/tstime/mono"
+ 	"tailscale.com/types/ipproto"
+@@ -1375,3 +1377,52 @@ func TestStackGSOToTunGSO(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestServiceEchoAddrs(t *testing.T) {
++	echo := func(src, dst netip.Addr) *packet.Parsed {
++		var h packet.Header = &packet.ICMP4Header{
++			IP4Header: packet.IP4Header{IPProto: ipproto.ICMPv4, Src: src, Dst: dst},
++			Type:      packet.ICMP4EchoRequest,
++		}
++		if dst.Is6() {
++			h = &packet.ICMP6Header{
++				IP6Header: packet.IP6Header{IPProto: ipproto.ICMPv6, Src: src, Dst: dst},
++				Type:      packet.ICMP6EchoRequest,
++			}
++		}
++		p := new(packet.Parsed)
++		p.Decode(packet.Generate(h, make([]byte, 4))) // identifier and sequence
++		if !p.IsEchoRequest() {
++			t.Fatalf("not an echo request: %v", p)
++		}
++		return p
++	}
++
++	v4 := netip.MustParseAddr("10.42.0.53")
++	v6 := netip.MustParseAddr("fd42::53")
++	legacy := []netip.Addr{tsaddr.TailscaleServiceIP(), tsaddr.TailscaleServiceIPv6()}
++	for _, tc := range []struct {
++		name  string
++		addrs []netip.Addr
++	}{{"none", nil}, {"custom", []netip.Addr{v4, v6}}, {"tailscale", legacy}} {
++		t.Run(tc.name, func(t *testing.T) {
++			_, tun := newFakeTUN(t.Logf, eventbustest.NewBus(t), false)
++			defer tun.Close()
++			tun.ServiceEchoAddrs = tc.addrs
++			tun.SetFilter(filter.NewAllowAllForTest(t.Logf))
++			for _, dst := range []netip.Addr{v4, v6, legacy[0], legacy[1]} {
++				src := netip.MustParseAddr("10.42.0.1")
++				if dst.Is6() {
++					src = netip.MustParseAddr("fd42::1")
++				}
++				want := filter.Accept
++				if slices.Contains(tc.addrs, dst) {
++					want = filter.DropSilently
++				}
++				if got, _ := tun.filterPacketOutboundToWireGuard(echo(src, dst), nil, nil); got != want {
++					t.Errorf("%v: filter response = %v, want %v", dst, got, want)
++				}
++			}
++		})
++	}
++}
+diff --git a/tsd/tsd.go b/tsd/tsd.go
+index 98b6a6bd367717d1251f0619aa11157c031978f9..445d3e5cf8479ba912b1b02c3e54c964e2b7a734 100644
+--- a/tsd/tsd.go
++++ b/tsd/tsd.go
+@@ -21,6 +21,7 @@
+ 	"crypto/x509"
+ 	"fmt"
+ 	"net/http"
++	"net/netip"
+ 	"reflect"
+ 
+ 	"tailscale.com/control/controlknobs"
+@@ -30,6 +31,7 @@
+ 	"tailscale.com/ipn/conffile"
+ 	"tailscale.com/net/dns"
+ 	"tailscale.com/net/netmon"
++	"tailscale.com/net/tsaddr"
+ 	"tailscale.com/net/tsdial"
+ 	"tailscale.com/net/tstun"
+ 	"tailscale.com/proxymap"
+@@ -152,6 +154,7 @@ type ft interface {
+ 		if _, ok := v.Unwrap().(ft); ok {
+ 			s.onlyNetstack = true
+ 		}
++		v.ServiceEchoAddrs = []netip.Addr{tsaddr.TailscaleServiceIP(), tsaddr.TailscaleServiceIPv6()}
+ 		s.Tun.Set(v)
+ 	case *magicsock.Conn:
+ 		s.MagicSock.Set(v)

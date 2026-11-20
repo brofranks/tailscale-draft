@@ -1,9 +1,9 @@
 name: Check patches
 on:
   push:
-    branches: [main]
+    branches: [main, rehearsal-addressing]
   pull_request:
-    branches: [main]
+    branches: [main, rehearsal-addressing]
 
 permissions:
   contents: read
@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   patches:
-    timeout-minutes: 20
+    timeout-minutes: 60
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -33,5 +33,18 @@ jobs:
         shell: bash
         run: |
           read -r _ base < ../upstream
-          git diff --name-only "$base" HEAD -- '*.go' | xargs -r dirname | sort -u |
-              sed 's|^|./|' | xargs -r ./tool/go run ./cmd/testwrapper -race
+          dirs=$(git diff --name-only "$base" HEAD -- '*.go' | xargs -r dirname | sort -u)
+          packages=()
+          while IFS= read -r dir; do
+            case "$dir" in
+              "") ;;
+              cmd/tsconnect/wasm)
+                GOOS=js GOARCH=wasm ./tool/go build -o "$RUNNER_TEMP/tsconnect.wasm" "./$dir" ;;
+              net/udprelay)
+                ./tool/go run ./cmd/testwrapper -race "./$dir" ;;
+              *) packages+=("./$dir") ;;
+            esac
+          done <<< "$dirs"
+          if ((${#packages[@]})); then
+            ./tool/go run ./cmd/testwrapper -race "${packages[@]}"
+          fi

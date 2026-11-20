@@ -1,0 +1,942 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <noreply@openai.com>
+Date: Thu, 19 Nov 2026 16:27:22 -0800
+Subject: [PATCH] net/dns,wgengine: publish and filter explicitly owned DNS
+ listeners
+
+Use the configured local listener set when publishing resolver policy
+and reading underlying DNS. Plain upstreams may use any formerly
+reserved address. Supply the daemon listeners at its entry points.
+---
+ cmd/tailscaled/tailscaled.go   |  3 ++
+ cmd/tsconnect/wasm/wasm_js.go  |  3 ++
+ feature/conn25/conn25_test.go  |  2 +-
+ net/dns/config.go              | 34 +++++++-------
+ net/dns/direct.go              | 30 +------------
+ net/dns/direct_test.go         | 16 +++++++
+ net/dns/dns_view.go            |  6 +--
+ net/dns/manager.go             | 70 ++++++++++++++++++-----------
+ net/dns/manager_apple_test.go  | 14 +++---
+ net/dns/manager_darwin.go      | 10 +----
+ net/dns/manager_darwin_test.go | 11 +++++
+ net/dns/manager_tcp_test.go    |  4 +-
+ net/dns/manager_test.go        | 82 +++++++++++++++++++++++++++++++---
+ net/dns/openresolv.go          | 23 +---------
+ net/dns/openresolv_test.go     |  6 +--
+ net/dns/osconfig.go            |  3 +-
+ net/dns/resolver/tsdns.go      | 30 ++++++-------
+ net/dns/resolver/tsdns_test.go |  2 +
+ net/tsaddr/tsaddr.go           |  5 +++
+ tsnet/tsnet.go                 |  3 ++
+ wgengine/userspace.go          |  6 ++-
+ wgengine/userspace_test.go     | 13 +++---
+ 22 files changed, 226 insertions(+), 150 deletions(-)
+
+diff --git a/cmd/tailscaled/tailscaled.go b/cmd/tailscaled/tailscaled.go
+index 88f6a7f390d3d334dae2944baba3916d73e44ed6..abe2d3951b83823f10e07792738b36e5013c379b 100644
+--- a/cmd/tailscaled/tailscaled.go
++++ b/cmd/tailscaled/tailscaled.go
+@@ -49,6 +49,7 @@
+ 	"tailscale.com/net/dnsfallback"
+ 	"tailscale.com/net/netmon"
+ 	"tailscale.com/net/netns"
++	"tailscale.com/net/tsaddr"
+ 	"tailscale.com/net/tsdial"
+ 	"tailscale.com/net/tstun"
+ 	"tailscale.com/paths"
+@@ -871,6 +872,8 @@ func tryEngine(logf logger.Logf, sys *tsd.System, name string) (onlyNetstack boo
+ 		SetSubsystem:  sys.Set,
+ 		ControlKnobs:  sys.ControlKnobs(),
+ 		EventBus:      sys.Bus.Get(),
++
++		DNSServiceAddrs: tsaddr.TailscaleServiceAddrs(),
+ 	}
+ 	if f, ok := hookSetWgEnginConfigDrive.GetOk(); ok {
+ 		f(&conf, logf)
+diff --git a/cmd/tsconnect/wasm/wasm_js.go b/cmd/tsconnect/wasm/wasm_js.go
+index 480b2c6b54f42de9b54cd7ee54a23dd3bb99a6b0..ec49be09f30b8c5c5420463ac5c9e6ef94019240 100644
+--- a/cmd/tsconnect/wasm/wasm_js.go
++++ b/cmd/tsconnect/wasm/wasm_js.go
+@@ -34,6 +34,7 @@
+ 	"tailscale.com/logpolicy"
+ 	"tailscale.com/logtail"
+ 	"tailscale.com/net/netns"
++	"tailscale.com/net/tsaddr"
+ 	"tailscale.com/net/tsdial"
+ 	"tailscale.com/safesocket"
+ 	"tailscale.com/tailcfg"
+@@ -113,6 +114,8 @@ func newIPN(jsConfig js.Value) map[string]any {
+ 		ExtraRootCAs:  sys.ExtraRootCAs,
+ 		Metrics:       sys.UserMetricsRegistry(),
+ 		EventBus:      sys.Bus.Get(),
++
++		DNSServiceAddrs: tsaddr.TailscaleServiceAddrs(),
+ 	})
+ 	if err != nil {
+ 		log.Fatal(err)
+diff --git a/feature/conn25/conn25_test.go b/feature/conn25/conn25_test.go
+index 5748ef17de7aca11f268bb4e9eb209677faf1a24..c5ef5c6a1f7c1d2207e7458a4cd7d5a988029715 100644
+--- a/feature/conn25/conn25_test.go
++++ b/feature/conn25/conn25_test.go
+@@ -1585,7 +1585,7 @@ func newTestSafeBackend(t *testing.T) *testSafeBackend {
+ 	dialer := tsdial.NewDialer(netmon.NewStatic())
+ 	sys.Dialer.Set(dialer)
+ 	ht := sys.HealthTracker.Get()
+-	sys.DNSManager.Set(dns.NewManager(logger.Discard, nil, ht, dialer, nil, nil, "", sys.Bus.Get()))
++	sys.DNSManager.Set(dns.NewManager(logger.Discard, nil, ht, dialer, nil, nil, "", sys.Bus.Get(), nil))
+ 	sys.Tun.Set(&tstun.Wrapper{})
+ 	return &testSafeBackend{sys: sys}
+ }
+diff --git a/net/dns/config.go b/net/dns/config.go
+index 2a35ecc89c883857573de90030d45c5f06de06ce..1ac8821db9fcb7498cdff63dca1fa7cf195b3cfc 100644
+--- a/net/dns/config.go
++++ b/net/dns/config.go
+@@ -8,6 +8,7 @@
+ 
+ import (
+ 	"bufio"
++	"errors"
+ 	"fmt"
+ 	"net/netip"
+ 	"reflect"
+@@ -18,8 +19,8 @@
+ 	"tailscale.com/envknob"
+ 	"tailscale.com/net/dns/publicdns"
+ 	"tailscale.com/net/dns/resolver"
+-	"tailscale.com/net/tsaddr"
+ 	"tailscale.com/types/dnstype"
++	"tailscale.com/types/views"
+ 	"tailscale.com/util/dnsname"
+ 	"tailscale.com/util/set"
+ )
+@@ -47,8 +48,7 @@ type Config struct {
+ 	SearchDomains []dnsname.FQDN
+ 	// Hosts maps DNS FQDNs to their IPs, which can be a mix of IPv4
+ 	// and IPv6.
+-	// Queries matching entries in Hosts are resolved locally by
+-	// 100.100.100.100 without leaving the machine.
++	// The local resolver answers queries matching entries in Hosts.
+ 	// Adding an entry to Hosts merely creates the record. If you want
+ 	// it to resolve, you also need to add appropriate routes to
+ 	// Routes.
+@@ -58,8 +58,7 @@ type Config struct {
+ 	// "node.tailnet.ts.net" is in SubdomainHosts, then queries for
+ 	// "anything.node.tailnet.ts.net" will resolve to node's IPs.
+ 	SubdomainHosts set.Set[dnsname.FQDN]
+-	// OnlyIPv6, if true, uses the IPv6 service IP (for MagicDNS)
+-	// instead of the IPv4 version (100.100.100.100).
++	// OnlyIPv6 limits the local DNS listeners published to the OS to IPv6.
+ 	OnlyIPv6 bool
+ 	// MagicDNSHostsUnrouted is whether MagicDNS host records are
+ 	// served on demand via [resolver.MagicDNSHosts] (so are not
+@@ -73,24 +72,25 @@ type Config struct {
+ 
+ var magicDNSDualStack = envknob.RegisterBool("TS_DEBUG_MAGIC_DNS_DUAL_STACK")
+ 
+-// serviceIPs returns the list of service IPs where MagicDNS is reachable.
++// serviceIPs selects owned listeners in the enabled address families.
++// A configuration that needs a local resolver requires at least one.
+ //
+ // The provided knobs may be nil.
+-func (c *Config) serviceIPs(knobs *controlknobs.Knobs) []netip.Addr {
+-	if c.OnlyIPv6 {
+-		return []netip.Addr{tsaddr.TailscaleServiceIPv6()}
+-	}
+-
++func (c *Config) serviceIPs(knobs *controlknobs.Knobs, owned views.Slice[netip.Addr]) ([]netip.Addr, error) {
+ 	// See https://github.com/tailscale/tailscale/issues/15404 for the background
+ 	// on the opt-in debug knob and the controlknob opt-out.
+-	if magicDNSDualStack() || !knobs.ShouldForceRegisterMagicDNSIPv4Only() {
+-		return []netip.Addr{
+-			tsaddr.TailscaleServiceIP(),
+-			tsaddr.TailscaleServiceIPv6(),
++	v4Only := !c.OnlyIPv6 && !magicDNSDualStack() && knobs.ShouldForceRegisterMagicDNSIPv4Only()
++	var ips []netip.Addr
++	for _, ip := range owned.All() {
++		if c.OnlyIPv6 && !ip.Is6() || v4Only && !ip.Is4() {
++			continue
+ 		}
++		ips = append(ips, ip)
+ 	}
+-
+-	return []netip.Addr{tsaddr.TailscaleServiceIP()}
++	if len(ips) == 0 {
++		return nil, errors.New("DNS policy requires a local resolver address in an enabled family")
++	}
++	return ips, nil
+ }
+ 
+ // WriteToBufioWriter write a debug version of c for logs to w, omitting
+diff --git a/net/dns/direct.go b/net/dns/direct.go
+index 82ddc9012be84f75cf951a7240aef44d81c22945..8b50f4f401dd8d28964400e3435e7ee973b64c58 100644
+--- a/net/dns/direct.go
++++ b/net/dns/direct.go
+@@ -18,7 +18,6 @@
+ 	"os/exec"
+ 	"path/filepath"
+ 	"runtime"
+-	"slices"
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
+@@ -28,7 +27,6 @@
+ 	"tailscale.com/health"
+ 	"tailscale.com/hostinfo"
+ 	"tailscale.com/net/dns/resolvconffile"
+-	"tailscale.com/net/tsaddr"
+ 	"tailscale.com/types/lazy"
+ 	"tailscale.com/types/logger"
+ 	"tailscale.com/util/dnsname"
+@@ -454,33 +452,7 @@ func (m *directManager) GetBaseConfig() (OSConfig, error) {
+ 		fileToRead = backupConf
+ 	}
+ 
+-	oscfg, err := m.readResolvFile(fileToRead)
+-	if err != nil {
+-		return OSConfig{}, err
+-	}
+-
+-	// On some systems, the backup configuration file is actually a
+-	// symbolic link to something owned by another DNS service (commonly,
+-	// resolved). Thus, it can be updated out from underneath us to contain
+-	// the Tailscale service IP, which results in an infinite loop of us
+-	// trying to send traffic to resolved, which sends back to us, and so
+-	// on. To solve this, drop the Tailscale service IP from the base
+-	// configuration; we do this in all situations since there's
+-	// essentially no world where we want to forward to ourselves.
+-	//
+-	// See: https://github.com/tailscale/tailscale/issues/7816
+-	var removed bool
+-	oscfg.Nameservers = slices.DeleteFunc(oscfg.Nameservers, func(ip netip.Addr) bool {
+-		if ip == tsaddr.TailscaleServiceIP() || ip == tsaddr.TailscaleServiceIPv6() {
+-			removed = true
+-			return true
+-		}
+-		return false
+-	})
+-	if removed {
+-		m.logf("[v1] dropped Tailscale IP from base config that was a symlink")
+-	}
+-	return oscfg, nil
++	return m.readResolvFile(fileToRead)
+ }
+ 
+ // HookWatchFile is a hook for watching file changes, for platforms that support it.
+diff --git a/net/dns/direct_test.go b/net/dns/direct_test.go
+index c96323571c1f9521477338d00a168ad379f289c1..a5d2ce29b1dfcbb2b08a87d9926b2e7777c76bc5 100644
+--- a/net/dns/direct_test.go
++++ b/net/dns/direct_test.go
+@@ -11,6 +11,7 @@
+ 	"net/netip"
+ 	"os"
+ 	"path/filepath"
++	"slices"
+ 	"strings"
+ 	"syscall"
+ 	"testing"
+@@ -201,3 +202,18 @@ func TestReadResolve(t *testing.T) {
+ 		c.Assert(cfg, qt.DeepEquals, test.want)
+ 	}
+ }
++
++func TestDirectBaseDNSServiceAddresses(t *testing.T) {
++	root := t.TempDir()
++	if err := os.Mkdir(filepath.Join(root, "etc"), 0700); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(root, "etc", "resolv.conf"), []byte("nameserver 100.100.100.100\nnameserver fd7a:115c:a1e0::53\n"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	m := directManager{fs: directFS{prefix: root}, logf: t.Logf}
++	got, err := m.GetBaseConfig()
++	if err != nil || !slices.Equal(got.Nameservers, serviceAddr46) {
++		t.Fatalf("base nameservers = %v, %v", got.Nameservers, err)
++	}
++}
+diff --git a/net/dns/dns_view.go b/net/dns/dns_view.go
+index 4d54c2613c92a38bfa4a395e14db680550f19098..399687ddb246aa4443bade0a6b99f49a9baca013 100644
+--- a/net/dns/dns_view.go
++++ b/net/dns/dns_view.go
+@@ -120,8 +120,7 @@ func (v ConfigView) SearchDomains() views.Slice[dnsname.FQDN] {
+ 
+ // Hosts maps DNS FQDNs to their IPs, which can be a mix of IPv4
+ // and IPv6.
+-// Queries matching entries in Hosts are resolved locally by
+-// 100.100.100.100 without leaving the machine.
++// The local resolver answers queries matching entries in Hosts.
+ // Adding an entry to Hosts merely creates the record. If you want
+ // it to resolve, you also need to add appropriate routes to
+ // Routes.
+@@ -137,8 +136,7 @@ func (v ConfigView) SubdomainHosts() views.Map[dnsname.FQDN, struct{}] {
+ 	return views.MapOf(v.ж.SubdomainHosts)
+ }
+ 
+-// OnlyIPv6, if true, uses the IPv6 service IP (for MagicDNS)
+-// instead of the IPv4 version (100.100.100.100).
++// OnlyIPv6 limits the local DNS listeners published to the OS to IPv6.
+ func (v ConfigView) OnlyIPv6() bool { return v.ж.OnlyIPv6 }
+ 
+ // MagicDNSHostsUnrouted is whether MagicDNS host records are
+diff --git a/net/dns/manager.go b/net/dns/manager.go
+index 8defe8f47bf9141461537ff71c89cf61e0f074cb..935eb1b0225ef2183406aa1894dfd05e7627de65 100644
+--- a/net/dns/manager.go
++++ b/net/dns/manager.go
+@@ -29,6 +29,7 @@
+ 	"tailscale.com/syncs"
+ 	"tailscale.com/types/dnstype"
+ 	"tailscale.com/types/logger"
++	"tailscale.com/types/views"
+ 	"tailscale.com/util/clientmetric"
+ 	"tailscale.com/util/dnsname"
+ 	"tailscale.com/util/eventbus"
+@@ -80,10 +81,11 @@ type Manager struct {
+ 	ctx       context.Context    // good until Down
+ 	ctxCancel context.CancelFunc // closes ctx
+ 
+-	resolver *resolver.Resolver
+-	os       OSConfigurator
+-	knobs    *controlknobs.Knobs // or nil
+-	goos     string              // if empty, gets set to runtime.GOOS
++	resolver     *resolver.Resolver
++	serviceAddrs views.Slice[netip.Addr] // immutable, includes every family we serve
++	os           OSConfigurator
++	knobs        *controlknobs.Knobs // or nil
++	goos         string              // if empty, gets set to runtime.GOOS
+ 
+ 	mu                  sync.Mutex // guards following
+ 	config              *Config    // Tracks the last viable DNS configuration set by Set.  nil on failures other than compilation failures or if set has never been called.
+@@ -93,8 +95,8 @@ type Manager struct {
+ 
+ // NewManager created a new manager from the given config.
+ //
+-// knobs may be nil.
+-func NewManager(logf logger.Logf, oscfg OSConfigurator, health *health.Tracker, dialer *tsdial.Dialer, linkSel resolver.ForwardLinkSelector, knobs *controlknobs.Knobs, goos string, bus *eventbus.Bus) *Manager {
++// knobs may be nil. serviceAddrs lists the IPs owned by the local resolver.
++func NewManager(logf logger.Logf, oscfg OSConfigurator, health *health.Tracker, dialer *tsdial.Dialer, linkSel resolver.ForwardLinkSelector, knobs *controlknobs.Knobs, goos string, bus *eventbus.Bus, serviceAddrs []netip.Addr) *Manager {
+ 	if !buildfeatures.HasDNS {
+ 		return nil
+ 	}
+@@ -109,13 +111,15 @@ func NewManager(logf logger.Logf, oscfg OSConfigurator, health *health.Tracker,
+ 		goos = runtime.GOOS
+ 	}
+ 
++	owned := views.SliceOf(slices.Clone(serviceAddrs))
+ 	m := &Manager{
+-		logf:     logf,
+-		resolver: resolver.New(logf, linkSel, dialer, health, knobs),
+-		os:       oscfg,
+-		health:   health,
+-		knobs:    knobs,
+-		goos:     goos,
++		serviceAddrs: owned,
++		logf:         logf,
++		resolver:     resolver.New(logf, linkSel, dialer, health, knobs, owned),
++		os:           oscfg,
++		health:       health,
++		knobs:        knobs,
++		goos:         goos,
+ 	}
+ 
+ 	m.eventClient = bus.Client("dns.Manager")
+@@ -192,7 +196,22 @@ func (m *Manager) GetBaseConfig() (OSConfig, error) {
+ 	if !buildfeatures.HasDNS {
+ 		panic("unreachable")
+ 	}
+-	return m.os.GetBaseConfig()
++	base, err := m.os.GetBaseConfig()
++	if err != nil || m.serviceAddrs.Len() == 0 {
++		return base, err
++	}
++	// A backup or another interface can refer back to one of our listeners.
++	// The backend may retain its snapshot for subsequent network changes.
++	owned := func(ip netip.Addr) bool { return views.SliceContains(m.serviceAddrs, ip.Unmap()) }
++	base.Nameservers = slices.DeleteFunc(slices.Clone(base.Nameservers), owned)
++	base.Resolvers = slices.DeleteFunc(slices.Clone(base.Resolvers), func(r *dnstype.Resolver) bool {
++		if r == nil {
++			return false
++		}
++		ap, ok := r.IPPort()
++		return ok && ap.Port() == 53 && owned(ap.Addr())
++	})
++	return base, nil
+ }
+ 
+ // setLocked sets the DNS configuration.
+@@ -329,8 +348,7 @@ func compileHostEntries(cfg Config) (hosts []*HostEntry) {
+ 	DependsOn: []*health.Warnable{health.NetworkStatusWarnable},
+ })
+ 
+-// compileConfig converts cfg into a quad-100 resolver configuration
+-// and an OS-level configuration.
++// compileConfig converts cfg into local resolver and OS configurations.
+ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig, err error) {
+ 	// The internal resolver always gets MagicDNS hosts and
+ 	// authoritative suffixes, even if we don't propagate MagicDNS to
+@@ -379,9 +397,8 @@ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig
+ 		// Trivial CorpDNS configuration, just override the OS resolver.
+ 		//
+ 		// If there are hosts (ExtraRecords) that are not covered by an existing
+-		// SplitDNS route, then we don't go into this path so that we fall into
+-		// the next case and send the extra record hosts queries through
+-		// 100.100.100.100 instead where we can answer them.
++		// SplitDNS route, the next case sends those queries through the local
++		// resolver so it can answer them.
+ 		//
+ 		// TODO: for OSes that support it, pass IP:port and DoH
+ 		// addresses directly to OS.
+@@ -390,11 +407,11 @@ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig
+ 		return rcfg, ocfg, nil
+ 	case cfg.hasDefaultResolvers():
+ 		// Default resolvers plus other stuff always ends up proxying
+-		// through quad-100.
++		// through the local resolver.
+ 		rcfg.Routes = routes
+ 		rcfg.Routes["."] = cfg.DefaultResolvers
+-		ocfg.Nameservers = cfg.serviceIPs(m.knobs)
+-		return rcfg, ocfg, nil
++		ocfg.Nameservers, err = cfg.serviceIPs(m.knobs, m.serviceAddrs)
++		return rcfg, ocfg, err
+ 	}
+ 
+ 	// From this point on, we're figuring out split DNS
+@@ -432,7 +449,10 @@ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig
+ 	// or routes + MagicDNS, or just MagicDNS, or on an OS that cannot
+ 	// split-DNS. Install a split config pointing at quad-100.
+ 	rcfg.Routes = routes
+-	ocfg.Nameservers = cfg.serviceIPs(m.knobs)
++	ocfg.Nameservers, err = cfg.serviceIPs(m.knobs, m.serviceAddrs)
++	if err != nil {
++		return resolver.Config{}, OSConfig{}, err
++	}
+ 
+ 	// Apple tunnels can contribute global search domains only through
+ 	// matchDomains with matchDomainsNoSearch=false; NEDNSSettings.searchDomains
+@@ -460,7 +480,7 @@ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig
+ 	// [OSConfigurator.GetBaseConfig] can temporarily fail immediately after an
+ 	// interface change. These failures should be retried if/when the OS indicates
+ 	// that the DNS configuration has changed via [RecompileDNSConfig].
+-	base, err := m.os.GetBaseConfig()
++	base, err := m.GetBaseConfig()
+ 	if err != nil {
+ 		if errors.Is(err, ErrGetBaseConfigNoResolvers) {
+ 			m.health.SetHealthy(OSConfigurationReadWarnable)
+@@ -504,7 +524,7 @@ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig
+ 		}
+ 		return resolver.Config{}, OSConfig{}, errEmptyBaseConfig
+ 	} else if len(defaultRoutes) == 0 {
+-		m.logf("dns: base config has no resolvers; quad-100 has no upstream for non-tailnet queries")
++		m.logf("dns: base config has no resolvers for forwarding non-local queries")
+ 	}
+ 
+ 	if isIOS && supportsSplitDNS && scopeApple {
+@@ -851,7 +871,7 @@ func CleanUp(logf logger.Logf, netMon *netmon.Monitor, bus *eventbus.Bus, health
+ 	d := &tsdial.Dialer{Logf: logf}
+ 	d.SetNetMon(netMon)
+ 	d.SetBus(bus)
+-	dns := NewManager(logf, oscfg, health, d, nil, nil, runtime.GOOS, bus)
++	dns := NewManager(logf, oscfg, health, d, nil, nil, runtime.GOOS, bus, nil)
+ 	if err := dns.Down(); err != nil {
+ 		logf("dns down: %v", err)
+ 	}
+diff --git a/net/dns/manager_apple_test.go b/net/dns/manager_apple_test.go
+index c4205fd20790a44958c952b54890a6f0d4ec1f38..94e68d390151ed23c43ea30d323eba24b62dc42f 100644
+--- a/net/dns/manager_apple_test.go
++++ b/net/dns/manager_apple_test.go
+@@ -18,6 +18,7 @@
+ 	"tailscale.com/net/tsdial"
+ 	"tailscale.com/tstest"
+ 	"tailscale.com/types/dnstype"
++	"tailscale.com/types/views"
+ 	"tailscale.com/util/dnsname"
+ 	"tailscale.com/util/eventbus/eventbustest"
+ )
+@@ -197,11 +198,12 @@ func TestManagerAppleDNSModes(t *testing.T) {
+ 						f.BaseConfig.Resolvers = tt.baseResolvers
+ 					}
+ 					m := &Manager{
+-						goos:   goos,
+-						os:     f,
+-						knobs:  knobs,
+-						health: health.NewTracker(eventbustest.NewBus(t)),
+-						logf:   t.Logf,
++						serviceAddrs: views.SliceOf(serviceAddr46),
++						goos:         goos,
++						os:           f,
++						knobs:        knobs,
++						health:       health.NewTracker(eventbustest.NewBus(t)),
++						logf:         t.Logf,
+ 					}
+ 					rcfg, ocfg, err := m.compileConfig(c)
+ 					if tt.noBase && tt.primary {
+@@ -290,7 +292,7 @@ func TestAppleBaseConfigWarningRecovery(t *testing.T) {
+ 				ht := health.NewTracker(bus)
+ 				dialer := tsdial.NewDialer(netmon.NewStatic())
+ 				dialer.SetBus(bus)
+-				m := NewManager(t.Logf, f, ht, dialer, nil, nil, goos, bus)
++				m := NewManager(t.Logf, f, ht, dialer, nil, nil, goos, bus, serviceAddr46)
+ 				m.resolver.TestOnlySetHook(f.SetResolver)
+ 				t.Cleanup(func() { m.Down() })
+ 				cfg := Config{Routes: upstreams("split.example", "192.0.2.53")}
+diff --git a/net/dns/manager_darwin.go b/net/dns/manager_darwin.go
+index a93a131f646bbf8cf4122dae2b7e7759b79efc04..393de7b30ce8393d4ccbb097a6cd6e9db57f2951 100644
+--- a/net/dns/manager_darwin.go
++++ b/net/dns/manager_darwin.go
+@@ -16,7 +16,6 @@
+ 	"tailscale.com/control/controlknobs"
+ 	"tailscale.com/health"
+ 	"tailscale.com/net/dns/resolvconffile"
+-	"tailscale.com/net/tsaddr"
+ 	"tailscale.com/types/logger"
+ 	"tailscale.com/util/eventbus"
+ 	"tailscale.com/util/mak"
+@@ -235,14 +234,7 @@ func (c *darwinConfigurator) GetBaseConfig() (OSConfig, error) {
+ 		return cfg, ErrGetBaseConfigNotSupported
+ 	}
+ 
+-	for _, ns := range resolvConf.Nameservers {
+-		if ns == tsaddr.TailscaleServiceIP() || ns == tsaddr.TailscaleServiceIPv6() {
+-			// If we find Quad100 in /etc/resolv.conf, we should ignore it
+-			c.logf("ignoring 100.100.100.100 resolver IP found in /etc/resolv.conf")
+-			continue
+-		}
+-		cfg.Nameservers = append(cfg.Nameservers, ns)
+-	}
++	cfg.Nameservers = resolvConf.Nameservers
+ 	cfg.SearchDomains = resolvConf.SearchDomains
+ 
+ 	if len(cfg.Nameservers) == 0 {
+diff --git a/net/dns/manager_darwin_test.go b/net/dns/manager_darwin_test.go
+index 98af980022be6f5200183e062c0a2912f33e51e9..a458312ac8cb838acc76a31d325b9077e44ad551 100644
+--- a/net/dns/manager_darwin_test.go
++++ b/net/dns/manager_darwin_test.go
+@@ -286,3 +286,14 @@ func fileExists(path string) bool {
+ 
+ 	panic("unexpected error checking file existence: " + err.Error())
+ }
++
++func TestDarwinBaseDNSServiceAddresses(t *testing.T) {
++	m := newTestConfigurator(t)
++	if err := os.WriteFile(m.resolvConfPath, []byte("nameserver 100.100.100.100\nnameserver fd7a:115c:a1e0::53\n"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	got, err := m.GetBaseConfig()
++	if err != nil || !slices.Equal(got.Nameservers, serviceAddr46) {
++		t.Fatalf("base nameservers = %v, %v", got.Nameservers, err)
++	}
++}
+diff --git a/net/dns/manager_tcp_test.go b/net/dns/manager_tcp_test.go
+index 67d6d15cd42ed0cf9248bf13aba080555b843a56..0ba2a1a000de1974c116c33c3a98bb55fbc99508 100644
+--- a/net/dns/manager_tcp_test.go
++++ b/net/dns/manager_tcp_test.go
+@@ -95,7 +95,7 @@ func TestDNSOverTCP(t *testing.T) {
+ 	dialer := tsdial.NewDialer(netmon.NewStatic())
+ 	dialer.SetBus(bus)
+ 	cknobs := &controlknobs.Knobs{}
+-	m := NewManager(t.Logf, &f, health.NewTracker(bus), dialer, nil, cknobs, "", bus)
++	m := NewManager(t.Logf, &f, health.NewTracker(bus), dialer, nil, cknobs, "", bus, serviceAddr46)
+ 	m.resolver.TestOnlySetHook(f.SetResolver)
+ 	m.Set(Config{
+ 		Hosts: hosts(
+@@ -183,7 +183,7 @@ func TestDNSOverTCP_TooLarge(t *testing.T) {
+ 	bus := eventbustest.NewBus(t)
+ 	dialer := tsdial.NewDialer(netmon.NewStatic())
+ 	dialer.SetBus(bus)
+-	m := NewManager(log, &f, health.NewTracker(bus), dialer, nil, nil, "", bus)
++	m := NewManager(log, &f, health.NewTracker(bus), dialer, nil, nil, "", bus, serviceAddr46)
+ 	m.resolver.TestOnlySetHook(f.SetResolver)
+ 	m.Set(Config{
+ 		Hosts:         hosts("andrew.ts.com.", "1.2.3.4"),
+diff --git a/net/dns/manager_test.go b/net/dns/manager_test.go
+index 2231c6f2d37044bd746920932ab82c121212fa4c..ce4be929f2ade765bf7838c6a3756ba77f7c6b2b 100644
+--- a/net/dns/manager_test.go
++++ b/net/dns/manager_test.go
+@@ -1269,7 +1269,7 @@ func TestManager(t *testing.T) {
+ 			bus := eventbustest.NewBus(t)
+ 			dialer := tsdial.NewDialer(netmon.NewStatic())
+ 			dialer.SetBus(bus)
+-			m := NewManager(t.Logf, &f, health.NewTracker(bus), dialer, nil, knobs, goos, bus)
++			m := NewManager(t.Logf, &f, health.NewTracker(bus), dialer, nil, knobs, goos, bus, serviceAddr46)
+ 			m.resolver.TestOnlySetHook(f.SetResolver)
+ 
+ 			if err := m.Set(test.in); err != nil {
+@@ -1378,7 +1378,7 @@ func TestConfigRecompilation(t *testing.T) {
+ 	bus := eventbustest.NewBus(t)
+ 	dialer := tsdial.NewDialer(netmon.NewStatic())
+ 	dialer.SetBus(bus)
+-	m := NewManager(t.Logf, f, health.NewTracker(bus), dialer, nil, nil, "darwin", bus)
++	m := NewManager(t.Logf, f, health.NewTracker(bus), dialer, nil, nil, "darwin", bus, serviceAddr46)
+ 
+ 	var managerConfig *resolver.Config
+ 	m.resolver.TestOnlySetHook(func(cfg resolver.Config) {
+@@ -1422,7 +1422,7 @@ func newEmptyBaseConfigManager(t *testing.T) (*Manager, *fakeOSConfigurator, *he
+ 	ht.SetAnyInterfaceUp(true) // else NetworkStatusWarnable suppresses the warning
+ 	dialer := tsdial.NewDialer(netmon.NewStatic())
+ 	dialer.SetBus(bus)
+-	m := NewManager(t.Logf, f, ht, dialer, nil, nil, "linux", bus)
++	m := NewManager(t.Logf, f, ht, dialer, nil, nil, "linux", bus, serviceAddr46)
+ 	m.resolver.TestOnlySetHook(f.SetResolver)
+ 	t.Cleanup(func() { m.Down() }) // stop the retry goroutine before the test ends
+ 	return m, f, ht
+@@ -1498,7 +1498,7 @@ func TestEmptyBaseConfigPlatforms(t *testing.T) {
+ 			bus := eventbustest.NewBus(t)
+ 			dialer := tsdial.NewDialer(netmon.NewStatic())
+ 			dialer.SetBus(bus)
+-			m := NewManager(t.Logf, f, health.NewTracker(bus), dialer, nil, nil, test.goos, bus)
++			m := NewManager(t.Logf, f, health.NewTracker(bus), dialer, nil, nil, test.goos, bus, serviceAddr46)
+ 			m.resolver.TestOnlySetHook(f.SetResolver)
+ 			t.Cleanup(func() { m.Down() })
+ 
+@@ -1690,7 +1690,7 @@ func TestTrampleRetrample(t *testing.T) {
+ 		bus := eventbustest.NewBus(t)
+ 		dialer := tsdial.NewDialer(netmon.NewStatic())
+ 		dialer.SetBus(bus)
+-		m := NewManager(t.Logf, f, health.NewTracker(bus), dialer, nil, nil, "linux", bus)
++		m := NewManager(t.Logf, f, health.NewTracker(bus), dialer, nil, nil, "linux", bus, serviceAddr46)
+ 
+ 		// Initial set should error out and store the config
+ 		if err := m.Set(config); err != nil {
+@@ -1776,7 +1776,7 @@ func TestSystemDNSDoHUpgrade(t *testing.T) {
+ 	bus := eventbustest.NewBus(t)
+ 	dialer := tsdial.NewDialer(netmon.NewStatic())
+ 	dialer.SetBus(bus)
+-	m := NewManager(logf, f, health.NewTracker(bus), dialer, nil, &controlknobs.Knobs{}, "linux", bus)
++	m := NewManager(logf, f, health.NewTracker(bus), dialer, nil, &controlknobs.Knobs{}, "linux", bus, serviceAddr46)
+ 	t.Cleanup(func() { m.Down() })
+ 
+ 	// Set up hook to capture the resolver config
+@@ -1902,3 +1902,73 @@ func buildTestDNSResponse(t *testing.T, domain string, ip netip.Addr) []byte {
+ 
+ 	return msg
+ }
++
++func TestDNSListenerOwnership(t *testing.T) {
++	const old4 = "100.100.100.100"
++	const old6 = "fd7a:115c:a1e0::53"
++	custom := mustIPs("10.99.0.53", "fd42::53")
++	for _, tc := range []struct {
++		name    string
++		owned   []netip.Addr
++		config  Config
++		split   bool
++		want    []netip.Addr
++		wantErr bool
++	}{
++		{"plain", nil, Config{DefaultResolvers: mustRes(old4, old6)}, false, mustIPs(old4, old6), false},
++		{"plain-with-listener", custom, Config{DefaultResolvers: mustRes(old4, old6)}, false, mustIPs(old4, old6), false},
++		{"direct-split", custom, Config{Routes: map[dnsname.FQDN][]*dnstype.Resolver{"corp.example.": mustRes(old4, old6)}}, true, mustIPs(old4, old6), false},
++		{"local-policy", custom, Config{DefaultResolvers: mustRes(old4), Routes: map[dnsname.FQDN][]*dnstype.Resolver{"corp.example.": nil}}, false, custom, false},
++		{"v6-listener", custom[1:], Config{DefaultResolvers: mustRes(old4), Routes: map[dnsname.FQDN][]*dnstype.Resolver{"corp.example.": nil}}, false, custom[1:], false},
++		{"missing-listener", nil, Config{DefaultResolvers: mustRes(old4), Routes: map[dnsname.FQDN][]*dnstype.Resolver{"corp.example.": nil}}, false, nil, true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			f := &fakeOSConfigurator{SplitDNS: tc.split}
++			bus := eventbustest.NewBus(t)
++			d := tsdial.NewDialer(netmon.NewStatic())
++			d.SetBus(bus)
++			m := NewManager(t.Logf, f, health.NewTracker(bus), d, nil, nil, "linux", bus, tc.owned)
++			defer m.Down()
++			err := m.Set(tc.config)
++			if (err != nil) != tc.wantErr || !slices.Equal(f.OSConfig.Nameservers, tc.want) {
++				t.Fatalf("published %v, error %v; want %v, error=%v", f.OSConfig.Nameservers, err, tc.want, tc.wantErr)
++			}
++		})
++	}
++}
++
++func TestBaseDNSServiceOwnership(t *testing.T) {
++	custom := mustIPs("10.99.0.53", "fd42::53")
++	bus := eventbustest.NewBus(t)
++	d := tsdial.NewDialer(netmon.NewStatic())
++	d.SetBus(bus)
++	f := new(fakeOSConfigurator)
++	base := OSConfig{Nameservers: mustIPs("10.99.0.53", "100.100.100.100", "fd42::53", "fd7a:115c:a1e0::53"),
++		Resolvers: mustRes("10.99.0.53", "[fd42::53]:53", "100.100.100.100", "10.99.0.53:5353", "https://dns.example/dns-query")}
++	f.setBaseConfig(base)
++	m := NewManager(t.Logf, f, health.NewTracker(bus), d, nil, nil, "linux", bus, custom)
++	defer m.Down()
++	m.resolver.TestOnlySetHook(f.SetResolver)
++	cfg := Config{Routes: map[dnsname.FQDN][]*dnstype.Resolver{"corp.example.": nil}}
++	if err := m.Set(cfg); err != nil {
++		t.Fatal(err)
++	}
++	want := mustRes("100.100.100.100", "10.99.0.53:5353", "https://dns.example/dns-query")
++	if !reflect.DeepEqual(f.ResolverConfig.Routes["."], want) {
++		t.Fatalf("forwarding = %v, want %v", f.ResolverConfig.Routes["."], want)
++	}
++	got, err := m.GetBaseConfig()
++	if err != nil || !slices.Equal(got.Nameservers, serviceAddr46) || !reflect.DeepEqual(got.Resolvers, want) {
++		t.Fatalf("base = %+v, %v", got, err)
++	}
++	if base.Nameservers[0] != custom[0] || base.Resolvers[0].Addr != "10.99.0.53" {
++		t.Fatal("backend snapshot was mutated")
++	}
++	f.setBaseConfig(OSConfig{Nameservers: mustIPs("fd42::53", "192.0.2.54")})
++	if err := m.RecompileDNSConfig(); err != nil {
++		t.Fatal(err)
++	}
++	if !reflect.DeepEqual(f.ResolverConfig.Routes["."], mustRes("192.0.2.54")) {
++		t.Fatalf("recompiled forwarding = %v", f.ResolverConfig.Routes["."])
++	}
++}
+diff --git a/net/dns/openresolv.go b/net/dns/openresolv.go
+index 4239f50e0e8deab9b983993d850dd39bc992029f..6a86bec00daf4a2b354583ba9e934438c4aabee5 100644
+--- a/net/dns/openresolv.go
++++ b/net/dns/openresolv.go
+@@ -9,12 +9,10 @@
+ 	"bytes"
+ 	"errors"
+ 	"fmt"
+-	"net/netip"
+ 	"os/exec"
+ 	"slices"
+ 	"strings"
+ 
+-	"tailscale.com/net/tsaddr"
+ 	"tailscale.com/types/logger"
+ )
+ 
+@@ -143,26 +141,7 @@ func (m openresolvManager) GetBaseConfig() (OSConfig, error) {
+ 	if err != nil {
+ 		return OSConfig{}, err
+ 	}
+-	cfg, err := readResolv(bytes.NewReader(out))
+-	if err != nil {
+-		return OSConfig{}, err
+-	}
+-
+-	// Forwarding to the Tailscale service IPs would make quad-100 send
+-	// queries to itself, in an infinite loop, so drop them if another
+-	// snippet names them. See tailscale/tailscale#7816.
+-	var removed bool
+-	cfg.Nameservers = slices.DeleteFunc(cfg.Nameservers, func(ip netip.Addr) bool {
+-		if ip == tsaddr.TailscaleServiceIP() || ip == tsaddr.TailscaleServiceIPv6() {
+-			removed = true
+-			return true
+-		}
+-		return false
+-	})
+-	if removed {
+-		m.logf("[v1] dropped Tailscale service IP from openresolv base config")
+-	}
+-	return cfg, nil
++	return readResolv(bytes.NewReader(out))
+ }
+ 
+ func (m openresolvManager) Close() error {
+diff --git a/net/dns/openresolv_test.go b/net/dns/openresolv_test.go
+index f6a03286d67652ece722aa4b7a2da625368168d1..6484759ce008626c95f395efd6003bcb9f5880db 100644
+--- a/net/dns/openresolv_test.go
++++ b/net/dns/openresolv_test.go
+@@ -142,15 +142,13 @@ func TestOpenresolvGetBaseConfig(t *testing.T) {
+ 			wantArgv: []string{"-i", "-l eth0"},
+ 		},
+ 		{
+-			// Defense in depth for tailscale/tailscale#7816: quad-100
+-			// must never become our own upstream, even if some other
+-			// snippet names it.
++			// The manager filters its own listeners after reading other snippets.
+ 			name: "quad-100_in_another_snippet",
+ 			resolvconf: fakeResolvconf{
+ 				listOut: "eth0\n",
+ 				dumpOut: "nameserver 100.100.100.100\nnameserver 192.168.1.1\nnameserver fd7a:115c:a1e0::53\nsearch lan\n",
+ 			},
+-			wantNameservers: []string{"192.168.1.1"},
++			wantNameservers: []string{"100.100.100.100", "192.168.1.1", "fd7a:115c:a1e0::53"},
+ 			wantSearch:      []string{"lan."},
+ 			wantArgv:        []string{"-i", "-l eth0"},
+ 		},
+diff --git a/net/dns/osconfig.go b/net/dns/osconfig.go
+index 59da3e9875b11836b4af8da596102a00aac69a49..e853270e851fce1a136c4580d44cfd7a2fd31e4b 100644
+--- a/net/dns/osconfig.go
++++ b/net/dns/osconfig.go
+@@ -32,7 +32,8 @@ type OSConfigurator interface {
+ 	// GetBaseConfig returns the OS's "base" configuration, i.e. the
+ 	// resolver settings the OS would use without Tailscale
+ 	// contributing any configuration.
+-	// GetBaseConfig must return the tailscale-free base config even
++	// GetBaseConfig returns the underlying resolver sources. The manager removes
++	// its own listener addresses. Backends must recover the base config even
+ 	// after SetDNS has been called to set a Tailscale configuration.
+ 	// Only works when SupportsSplitDNS=false.
+ 
+diff --git a/net/dns/resolver/tsdns.go b/net/dns/resolver/tsdns.go
+index 3e22a83c0159f4b177e51aaa7b4244042cc7bf3b..60ad943f3a452929c361c4485d393d1c0f4686af 100644
+--- a/net/dns/resolver/tsdns.go
++++ b/net/dns/resolver/tsdns.go
+@@ -36,6 +36,7 @@
+ 	"tailscale.com/syncs"
+ 	"tailscale.com/types/dnstype"
+ 	"tailscale.com/types/logger"
++	"tailscale.com/types/views"
+ 	"tailscale.com/util/clientmetric"
+ 	"tailscale.com/util/cloudenv"
+ 	"tailscale.com/util/dnsname"
+@@ -235,6 +236,7 @@ type Resolver struct {
+ 	dialer             *tsdial.Dialer   // non-nil
+ 	health             *health.Tracker  // non-nil
+ 	saveConfigForTests func(cfg Config) // used in tests to capture resolver config
++	serviceAddrs       views.Slice[netip.Addr]
+ 	// forwarder forwards requests to upstream nameservers.
+ 	forwarder *forwarder
+ 
+@@ -308,7 +310,7 @@ type ForwardLinkSelector interface {
+ 
+ // New returns a new resolver.
+ // dialer and health must be non-nil.
+-func New(logf logger.Logf, linkSel ForwardLinkSelector, dialer *tsdial.Dialer, health *health.Tracker, knobs *controlknobs.Knobs) *Resolver {
++func New(logf logger.Logf, linkSel ForwardLinkSelector, dialer *tsdial.Dialer, health *health.Tracker, knobs *controlknobs.Knobs, serviceAddrs views.Slice[netip.Addr]) *Resolver {
+ 	if dialer == nil {
+ 		panic("nil Dialer")
+ 	}
+@@ -320,13 +322,14 @@ func New(logf logger.Logf, linkSel ForwardLinkSelector, dialer *tsdial.Dialer, h
+ 		logf("nil netMon")
+ 	}
+ 	r := &Resolver{
+-		logf:     logger.WithPrefix(logf, "resolver: "),
+-		netMon:   netMon,
+-		closed:   make(chan struct{}),
+-		hostToIP: map[dnsname.FQDN][]netip.Addr{},
+-		ipToHost: map[netip.Addr]dnsname.FQDN{},
+-		dialer:   dialer,
+-		health:   health,
++		serviceAddrs: serviceAddrs,
++		logf:         logger.WithPrefix(logf, "resolver: "),
++		netMon:       netMon,
++		closed:       make(chan struct{}),
++		hostToIP:     map[dnsname.FQDN][]netip.Addr{},
++		ipToHost:     map[netip.Addr]dnsname.FQDN{},
++		dialer:       dialer,
++		health:       health,
+ 	}
+ 	r.forwarder = newForwarder(r.logf, netMon, linkSel, dialer, health, knobs)
+ 	return r
+@@ -509,15 +512,8 @@ func (r *Resolver) HandlePeerDNSQuery(ctx context.Context, q []byte, from netip.
+ 		// TODO: more than 1 resolver from /etc/resolv.conf?
+ 
+ 		var resolvers []resolverAndDelay
+-		switch nameserver {
+-		case tsaddr.TailscaleServiceIP(), tsaddr.TailscaleServiceIPv6():
+-			// If resolv.conf says 100.100.100.100, it's coming right back to us anyway
+-			// so avoid the loop through the kernel and just do what we
+-			// would've done anyway. By not passing any resolvers, the forwarder
+-			// will use its default ones from our DNS config.
+-		case netip.Addr{}:
+-			// Likewise, if the platform has no resolv.conf, just use our defaults.
+-		default:
++		// An OS stub pointing at our listener uses the configured forwarding routes.
++		if nameserver.IsValid() && !views.SliceContains(r.serviceAddrs, nameserver.Unmap()) {
+ 			resolvers = []resolverAndDelay{{
+ 				name: &dnstype.Resolver{Addr: net.JoinHostPort(nameserver.String(), "53")},
+ 			}}
+diff --git a/net/dns/resolver/tsdns_test.go b/net/dns/resolver/tsdns_test.go
+index 57157dd139725bff3e53c802469a49c4f00d9de1..5a4630aff6fdc564f1fc0561337553c643fba982 100644
+--- a/net/dns/resolver/tsdns_test.go
++++ b/net/dns/resolver/tsdns_test.go
+@@ -30,6 +30,7 @@
+ 	"tailscale.com/tstest"
+ 	"tailscale.com/types/dnstype"
+ 	"tailscale.com/types/logger"
++	"tailscale.com/types/views"
+ 	"tailscale.com/util/dnsname"
+ 	"tailscale.com/util/eventbus/eventbustest"
+ 	"tailscale.com/util/set"
+@@ -362,6 +363,7 @@ func newResolver(t testing.TB) *Resolver {
+ 		dialer,
+ 		health.NewTracker(bus),
+ 		nil, // no control knobs
++		views.Slice[netip.Addr]{},
+ 	)
+ }
+ 
+diff --git a/net/tsaddr/tsaddr.go b/net/tsaddr/tsaddr.go
+index 52f9d4d11de4e6ab0762348dda2bc1e72e01dd8e..0793c4a0ba71ed8804a9269ea95b9700ea63fc88 100644
+--- a/net/tsaddr/tsaddr.go
++++ b/net/tsaddr/tsaddr.go
+@@ -45,6 +45,11 @@ func CGNATRange() netip.Prefix {
+ 	serviceIPv6  oncePrefix
+ )
+ 
++// TailscaleServiceAddrs returns the IPv4 and IPv6 listeners owned by tailscaled.
++func TailscaleServiceAddrs() []netip.Addr {
++	return []netip.Addr{TailscaleServiceIP(), TailscaleServiceIPv6()}
++}
++
+ // TailscaleServiceIP returns the IPv4 listen address of services
+ // provided by Tailscale itself such as the MagicDNS proxy.
+ //
+diff --git a/tsnet/tsnet.go b/tsnet/tsnet.go
+index 999580426a3ea1c0259acb81293dfb3da8385f54..bc5fdbd8bd17e21e0ac8fe0b47ae51922a6c6b91 100644
+--- a/tsnet/tsnet.go
++++ b/tsnet/tsnet.go
+@@ -200,6 +200,7 @@
+ 	"tailscale.com/net/netmon"
+ 	"tailscale.com/net/proxymux"
+ 	"tailscale.com/net/socks5"
++	"tailscale.com/net/tsaddr"
+ 	"tailscale.com/net/tsdial"
+ 	"tailscale.com/tailcfg"
+ 	"tailscale.com/tailcfg/peercap"
+@@ -906,6 +907,8 @@ func (s *Server) start() (reterr error) {
+ 		HealthTracker: sys.HealthTracker.Get(),
+ 		ExtraRootCAs:  sys.ExtraRootCAs,
+ 		Metrics:       sys.UserMetricsRegistry(),
++
++		DNSServiceAddrs: tsaddr.TailscaleServiceAddrs(),
+ 	})
+ 	if err != nil {
+ 		return err
+diff --git a/wgengine/userspace.go b/wgengine/userspace.go
+index fc76ca990bb3cb3df9e12249710d65f4f11f5d1b..695696840b1c4c9dd3e1fe50a6e5fca2e3d08fde 100644
+--- a/wgengine/userspace.go
++++ b/wgengine/userspace.go
+@@ -224,6 +224,10 @@ type Config struct {
+ 	// through to magicsock.
+ 	DERPAppName string
+ 
++	// DNSServiceAddrs are the local DNS listeners owned by the engine's caller.
++	// An empty slice means there are no local DNS listeners.
++	DNSServiceAddrs []netip.Addr
++
+ 	// ControlKnobs is the set of control plane-provied knobs
+ 	// to use.
+ 	// If nil, defaults are used.
+@@ -415,7 +419,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error)
+ 	conf.Dialer.SetTUNName(tunName)
+ 	conf.Dialer.SetNetMon(e.netMon)
+ 	conf.Dialer.SetBus(e.eventBus)
+-	e.dns = dns.NewManager(logf, conf.DNS, e.health, conf.Dialer, fwdDNSLinkSelector{e, tunName}, conf.ControlKnobs, runtime.GOOS, e.eventBus)
++	e.dns = dns.NewManager(logf, conf.DNS, e.health, conf.Dialer, fwdDNSLinkSelector{e, tunName}, conf.ControlKnobs, runtime.GOOS, e.eventBus, conf.DNSServiceAddrs)
+ 
+ 	// TODO: there's probably a better place for this
+ 	sockstats.SetNetMon(e.netMon)
+diff --git a/wgengine/userspace_test.go b/wgengine/userspace_test.go
+index 0aff1b401c5c41049e63405966ae3b66e2c36369..7088d6e051b9ab81926a1692f3b49da91510a29e 100644
+--- a/wgengine/userspace_test.go
++++ b/wgengine/userspace_test.go
+@@ -167,7 +167,7 @@ func TestUserspaceEngineReconfigDNSAfterRouterError(t *testing.T) {
+ 	ue.router = failingRouter{err: routerErr}
+ 
+ 	osCfg := &recordingOSConfigurator{}
+-	ue.dns = dns.NewManager(t.Logf, osCfg, ht, ue.dialer, nil, nil, runtime.GOOS, bus)
++	ue.dns = dns.NewManager(t.Logf, osCfg, ht, ue.dialer, nil, nil, runtime.GOOS, bus, nil)
+ 
+ 	nm := &netmap.NetworkMap{
+ 		Peers: nodeViews([]*tailcfg.Node{{ID: 1, Key: nkFromHex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")}}),
+@@ -412,11 +412,12 @@ func TestLinkChangeReapplyPreservesMagicDNSRoutes(t *testing.T) {
+ 		t.Fatal(err)
+ 	}
+ 	e, err := NewUserspaceEngine(t.Logf, Config{
+-		HealthTracker: health.NewTracker(bus),
+-		Metrics:       new(usermetric.Registry),
+-		EventBus:      bus,
+-		DNS:           noop,
+-		RespondToPing: true,
++		HealthTracker:   health.NewTracker(bus),
++		Metrics:         new(usermetric.Registry),
++		EventBus:        bus,
++		DNS:             noop,
++		DNSServiceAddrs: []netip.Addr{netip.MustParseAddr("100.100.100.100")},
++		RespondToPing:   true,
+ 	})
+ 	if err != nil {
+ 		t.Fatal(err)

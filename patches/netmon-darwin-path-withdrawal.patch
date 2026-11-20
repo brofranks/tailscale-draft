@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <noreply@openai.com>
+Date: Thu, 19 Nov 2026 13:58:46 -0800
+Subject: [PATCH] net/netmon: withdraw an empty Darwin provider path
+
+Clear the previously reported default interface when the provider loses
+its path. An interface can remain up and numbered after losing its
+default route.
+---
+ net/netmon/defaultroute_darwin.go    |  7 ++-----
+ net/netmon/interfaces_darwin_test.go | 24 ++++++++++++++++++++++++
+ 2 files changed, 26 insertions(+), 5 deletions(-)
+
+diff --git a/net/netmon/defaultroute_darwin.go b/net/netmon/defaultroute_darwin.go
+index 121535937bc22685d058e88cd69a2d99fae673e9..1d0b79c04a2d88e7dc82a5e745fb25e2ce3b90cc 100644
+--- a/net/netmon/defaultroute_darwin.go
++++ b/net/netmon/defaultroute_darwin.go
+@@ -19,12 +19,9 @@
+ )
+ 
+ // UpdateLastKnownDefaultRouteInterface is called by ipn-go-bridge from apple network extensions when
+-// our NWPathMonitor instance detects a network path transition.
++// our NWPathMonitor instance detects a network path transition. An empty name withdraws the last path.
+ func UpdateLastKnownDefaultRouteInterface(ifName string) {
+-	if ifName == "" {
+-		return
+-	}
+-	if old := lastKnownDefaultRouteIfName.Swap(ifName); old != ifName {
++	if old := lastKnownDefaultRouteIfName.Swap(ifName); old != ifName && ifName != "" {
+ 		interfaces, err := netInterfaces()
+ 		if err != nil {
+ 			log.Printf("defaultroute_darwin: UpdateLastKnownDefaultRouteInterface could not get interfaces: %v", err)
+diff --git a/net/netmon/interfaces_darwin_test.go b/net/netmon/interfaces_darwin_test.go
+index e4b84a144a432f08851252bb0995b06482dcbfa2..1041bf6eb921494df3aef5be363c6fad2f1ad8ab 100644
+--- a/net/netmon/interfaces_darwin_test.go
++++ b/net/netmon/interfaces_darwin_test.go
+@@ -5,11 +5,13 @@
+ 
+ import (
+ 	"io"
++	"net"
+ 	"net/netip"
+ 	"os/exec"
+ 	"testing"
+ 
+ 	"go4.org/mem"
++	"tailscale.com/tstest"
+ 	"tailscale.com/util/lineiter"
+ 	"tailscale.com/version"
+ )
+@@ -134,3 +136,25 @@ func TestUpdateLastKnownDefaultRouteInterface(t *testing.T) {
+ 		t.Errorf("OSDefaultRoute() = %q, want %q", got, want)
+ 	}
+ }
++
++func TestDefaultRouteWithdrawal(t *testing.T) {
++	old := lastKnownDefaultRouteIfName.Load()
++	t.Cleanup(func() { lastKnownDefaultRouteIfName.Store(old) })
++	tstest.Replace(t, &altNetInterfaces, func() ([]Interface, error) {
++		var ifs []Interface
++		for i, name := range []string{"link1", "link2"} {
++			ifs = append(ifs, Interface{
++				Interface: &net.Interface{Name: name, Index: i + 1, Flags: net.FlagUp},
++				AltAddrs:  []net.Addr{&net.IPNet{IP: net.IPv4(192, 0, 2, byte(i+1)), Mask: net.CIDRMask(24, 32)}},
++			})
++		}
++		return ifs, nil
++	})
++	for _, name := range []string{"link1", "", "link2"} {
++		UpdateLastKnownDefaultRouteInterface(name)
++		d, err := OSDefaultRoute()
++		if d.InterfaceName != name || (err != nil) != (name == "") {
++			t.Fatalf("after %q: default = %q, %v", name, d.InterfaceName, err)
++		}
++	}
++}

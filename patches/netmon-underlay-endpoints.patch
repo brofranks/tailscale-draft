@@ -1,0 +1,210 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brody Franks <brody@franks.id.au>
+Date: Thu, 19 Nov 2026 12:48:20 -0800
+Subject: [PATCH] net/netmon,wgengine: offer CGNAT LAN endpoints for registered
+ tunnels
+
+An address on another eligible interface can be a direct IPv4 path on
+a shared CGNAT LAN. Preserve tunnel exclusion by name and conservative
+IPv6 eligibility. The daemon and relay explicitly select their range
+policy.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Brody Franks <brody@franks.id.au>
+---
+ cmd/tailscaled/tailscaled.go    |  2 ++
+ net/netmon/interfaces_test.go   | 38 ++++++++++++++++++++++++++++++++-
+ net/netmon/state.go             | 12 +++++------
+ net/udprelay/server.go          |  2 +-
+ tsnet/tsnet.go                  |  2 ++
+ wgengine/magicsock/magicsock.go |  7 +++++-
+ wgengine/userspace.go           |  5 +++++
+ 7 files changed, 58 insertions(+), 10 deletions(-)
+
+diff --git a/cmd/tailscaled/tailscaled.go b/cmd/tailscaled/tailscaled.go
+index 1b0ee602a6c37b0afbda5c9b7177b30676527886..88f6a7f390d3d334dae2944baba3916d73e44ed6 100644
+--- a/cmd/tailscaled/tailscaled.go
++++ b/cmd/tailscaled/tailscaled.go
+@@ -860,6 +860,8 @@ func handleSubnetsInNetstack() bool {
+ 
+ func tryEngine(logf logger.Logf, sys *tsd.System, name string) (onlyNetstack bool, err error) {
+ 	conf := wgengine.Config{
++		ExcludeCGNATEndpoints: true,
++
+ 		ListenPort:    args.port,
+ 		NetMon:        sys.NetMon.Get(),
+ 		HealthTracker: sys.HealthTracker.Get(),
+diff --git a/net/netmon/interfaces_test.go b/net/netmon/interfaces_test.go
+index 55728e706c300160c5974f38f34d24e83589f29f..9d06d0f5ed6b8ee20a7ad1c32729aff313363b64 100644
+--- a/net/netmon/interfaces_test.go
++++ b/net/netmon/interfaces_test.go
+@@ -127,6 +127,42 @@ func TestLikelyHomeRouterIP(t *testing.T) {
+ 	})
+ }
+ 
++func TestLocalAddressesCGNAT(t *testing.T) {
++	oldName, oldIndex := tsIfProps.tsIfName(), tsIfProps.tsIfIndex()
++	t.Cleanup(func() { tsIfProps.set(oldName, oldIndex) })
++	iface := func(name, ip string) Interface {
++		host := netip.MustParseAddr(ip)
++		return Interface{Interface: &net.Interface{Name: name, Flags: net.FlagUp},
++			AltAddrs: []net.Addr{&net.IPNet{IP: host.AsSlice(), Mask: net.CIDRMask(host.BitLen(), host.BitLen())}}}
++	}
++	lan := iface("lan", "100.70.1.9")
++	tunnel := iface("wg0", "100.70.1.10")
++	otherVPN := iface("tailscale0", "100.82.2.3")
++	ula := iface("lan6", "fd7a:115c:a1e0:2::9")
++	ifs := []Interface{lan, tunnel, otherVPN, ula}
++	tstest.Replace(t, &altNetInterfaces, func() ([]Interface, error) { return ifs, nil })
++	for _, tc := range []struct {
++		name, registered string
++		exclude          bool
++		want             []netip.Addr
++	}{
++		{"unregistered", "", false, nil},
++		{"registered", "wg0", false, []netip.Addr{netip.MustParseAddr("100.70.1.9"), netip.MustParseAddr("100.82.2.3")}},
++		{"tailscale", "wg0", true, nil},
++	} {
++		tsIfProps.set(tc.registered, 0)
++		got, _, err := LocalAddresses(tc.exclude)
++		if err != nil || !slices.Equal(got, tc.want) {
++			t.Errorf("%s: %v, %v; want %v", tc.name, got, err, tc.want)
++		}
++	}
++	ifs = []Interface{ula}
++	got, _, err := LocalAddresses(false)
++	if err != nil || len(got) != 0 {
++		t.Errorf("ULA-only = %v, %v, want no candidates", got, err)
++	}
++}
++
+ func TestLocalAddressesSkipsTailscaleInterface(t *testing.T) {
+ 	up := net.FlagUp | net.FlagBroadcast | net.FlagMulticast | net.FlagRunning
+ 	tstest.Replace(t, &altNetInterfaces, func() ([]Interface, error) {
+@@ -145,7 +181,7 @@ func TestLocalAddressesSkipsTailscaleInterface(t *testing.T) {
+ 	SetTailscaleInterfaceProps("wg0", 2)
+ 	t.Cleanup(func() { tsIfProps.set("", 0) })
+ 
+-	regular, _, err := LocalAddresses()
++	regular, _, err := LocalAddresses(false)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+diff --git a/net/netmon/state.go b/net/netmon/state.go
+index 6463f41d89328aa4c8fd98ec99eee290688391dd..faff62b0eee8d8ca8a880afd277f958c0fac5e41 100644
+--- a/net/netmon/state.go
++++ b/net/netmon/state.go
+@@ -56,7 +56,9 @@ func isProblematicInterface(nif *net.Interface) bool {
+ // whether they're loopback addresses. If there are no regular addresses
+ // it will return any IPv4 linklocal or IPv6 unique local addresses because we
+ // know of environments where these are used with NAT to provide connectivity.
+-func LocalAddresses() (regular, loopback []netip.Addr, err error) {
++// excludeCGNAT excludes IPv4 addresses in Tailscale's allocation range even
++// when the registered tunnel can be identified by name.
++func LocalAddresses(excludeCGNAT bool) (regular, loopback []netip.Addr, err error) {
+ 	// TODO(crawshaw): don't serve interface addresses that we are routing
+ 	ifaces, err := netInterfaces()
+ 	if err != nil {
+@@ -89,12 +91,8 @@ func LocalAddresses() (regular, loopback []netip.Addr, err error) {
+ 					continue
+ 				}
+ 				ip = ip.Unmap()
+-				// TODO(apenwarr): don't special case cgNAT.
+-				// In the general wireguard case, it might
+-				// very well be something we can route to
+-				// directly, because both nodes are
+-				// behind the same CGNAT router.
+-				if tsaddr.IsTailscaleIP(ip) {
++				// With a known tunnel, another interface may be a reachable CGNAT LAN.
++				if tsaddr.IsTailscaleIP(ip) && (excludeCGNAT || tsIfName == "" || ip.Is6()) {
+ 					continue
+ 				}
+ 				if ip.IsLoopback() || ifcIsLoopback {
+diff --git a/net/udprelay/server.go b/net/udprelay/server.go
+index 40cbbfca714c93735da06579e5295f15e26c7e84..a5614eb8a24d162a46731a97d3a00d8c349a878a 100644
+--- a/net/udprelay/server.go
++++ b/net/udprelay/server.go
+@@ -467,7 +467,7 @@ func (s *Server) addrDiscoveryLoop() {
+ 		addrPorts.Make()
+ 
+ 		// get local addresses
+-		ips, _, err := netmon.LocalAddresses()
++		ips, _, err := netmon.LocalAddresses(true)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+diff --git a/tsnet/tsnet.go b/tsnet/tsnet.go
+index 66b6506da7eefd3f52570970cb62d731adf040ce..999580426a3ea1c0259acb81293dfb3da8385f54 100644
+--- a/tsnet/tsnet.go
++++ b/tsnet/tsnet.go
+@@ -894,6 +894,8 @@ func (s *Server) start() (reterr error) {
+ 	s.dialer = &tsdial.Dialer{Logf: tsLogf} // mutated below (before used)
+ 	s.dialer.SetBus(sys.Bus.Get())
+ 	eng, err := wgengine.NewUserspaceEngine(tsLogf, wgengine.Config{
++		ExcludeCGNATEndpoints: true,
++
+ 		Tun:           s.Tun,
+ 		EventBus:      sys.Bus.Get(),
+ 		ListenPort:    s.Port,
+diff --git a/wgengine/magicsock/magicsock.go b/wgengine/magicsock/magicsock.go
+index 748f42643bbcdbe84fe13f1566133349f4adc9c7..d6bd84c17b71c742b3bb3cc42c5129859b144f2d 100644
+--- a/wgengine/magicsock/magicsock.go
++++ b/wgengine/magicsock/magicsock.go
+@@ -166,6 +166,7 @@ type Conn struct {
+ 	derpActiveFunc         func()
+ 	idleFunc               func() time.Duration // nil means unknown
+ 	testOnlyPacketListener nettype.PacketListener
++	excludeCGNATEndpoints  bool
+ 	onDERPRecv             func(tailcfg.DERPRegionID, key.NodePublic, []byte) bool // or nil, see Options.OnDERPRecv
+ 	netMon                 *netmon.Monitor                                         // must be non-nil
+ 	health                 *health.Tracker                                         // or nil
+@@ -504,6 +505,9 @@ type Options struct {
+ 	// In regular use, this will be wgengine.(*userspaceEngine).PeerByKey.
+ 	PeerByKeyFunc func(key.NodePublic) (_ wgint.Peer, ok bool)
+ 
++	// ExcludeCGNATEndpoints excludes Tailscale-range IPv4 addresses on other interfaces.
++	ExcludeCGNATEndpoints bool
++
+ 	// DisablePortMapper, if true, disables the portmapper.
+ 	// This is primarily useful in tests.
+ 	DisablePortMapper bool
+@@ -697,6 +701,7 @@ func NewConn(opts Options) (*Conn, error) {
+ 		// their own Tailscale build from pieces.
+ 	}
+ 
++	c.excludeCGNATEndpoints = opts.ExcludeCGNATEndpoints
+ 	c.netMon = opts.NetMon
+ 	c.health = opts.HealthTracker
+ 	c.extraRootCAs = opts.ExtraRootCAs
+@@ -1469,7 +1474,7 @@ func (c *Conn) localEndpoints(haveOther bool) ([]netip.AddrPort, error) {
+ 		return ap.Port() != 0 && ap.Addr().Unmap().IsUnspecified()
+ 	}
+ 	if wildcard(v4) || wildcard(v6) {
+-		ips, loopback, err := netmon.LocalAddresses()
++		ips, loopback, err := netmon.LocalAddresses(c.excludeCGNATEndpoints)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+diff --git a/wgengine/userspace.go b/wgengine/userspace.go
+index cc45fd404b4f3f82b6c3b17f5a07572c3880e436..fc76ca990bb3cb3df9e12249710d65f4f11f5d1b 100644
+--- a/wgengine/userspace.go
++++ b/wgengine/userspace.go
+@@ -178,6 +178,9 @@ type Config struct {
+ 	// If nil, a fake Device that does nothing is used.
+ 	Tun tun.Device
+ 
++	// ExcludeCGNATEndpoints excludes Tailscale-range IPv4 addresses from local UDP candidates.
++	ExcludeCGNATEndpoints bool
++
+ 	// IsTAP is whether Tun is actually a TAP (Layer 2) device that'll
+ 	// require ethernet headers.
+ 	IsTAP bool
+@@ -427,6 +430,8 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error)
+ 		e.RequestStatus()
+ 	}
+ 	magicsockOpts := magicsock.Options{
++		ExcludeCGNATEndpoints: conf.ExcludeCGNATEndpoints,
++
+ 		EventBus:       e.eventBus,
+ 		Logf:           logf,
+ 		Port:           conf.ListenPort,

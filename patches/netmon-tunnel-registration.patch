@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <noreply@openai.com>
+Date: Thu, 19 Nov 2026 16:27:22 -0800
+Subject: [PATCH] net/netmon: retain the tunnel name when index lookup fails
+
+The tunnel name is supplied by its owner. Preserve it across a failed
+kernel lookup and discard any index from the previous registration.
+Provider inventories may supply synthetic indices.
+---
+ net/netmon/interfaces.go      | 19 ++++++-------------
+ net/netmon/interfaces_test.go | 28 ++++++++++++++++++++++++++++
+ 2 files changed, 34 insertions(+), 13 deletions(-)
+
+diff --git a/net/netmon/interfaces.go b/net/netmon/interfaces.go
+index c7a2cb213e89386d66db124249a60b654e03adb5..a2d5b92165e8d4d3edb4e3220b38f7b4167ba9be 100644
+--- a/net/netmon/interfaces.go
++++ b/net/netmon/interfaces.go
+@@ -46,6 +46,8 @@ func (m *Monitor) SetTailscaleInterfaceName(ifName string) {
+ 	SetTailscaleInterfaceProps(ifName, 0)
+ }
+ 
++var kernelInterfaceByName = net.InterfaceByName
++
+ // SetTailscaleInterfaceProps sets the name of the Tailscale interface and
+ // its index for use by various listeners/dialers.  If the index is zero,
+ // an attempt will be made to look it up by name.  This makes no attempt
+@@ -56,20 +58,11 @@ func (m *Monitor) SetTailscaleInterfaceName(ifName string) {
+ //
+ // This should be called as early as possible during tailscaled startup.
+ func SetTailscaleInterfaceProps(ifName string, ifIndex int) {
+-	if ifIndex != 0 {
+-		tsIfProps.set(ifName, ifIndex)
+-		return
+-	}
+-
+-	ifaces, err := net.Interfaces()
+-	if err != nil {
+-		return
+-	}
+-
+-	for _, iface := range ifaces {
+-		if iface.Name == ifName {
++	if ifName != "" && ifIndex == 0 {
++		// Only the OS can supply a kernel interface index. A provider may
++		// supply synthetic indices in its network inventory.
++		if iface, err := kernelInterfaceByName(ifName); err == nil {
+ 			ifIndex = iface.Index
+-			break
+ 		}
+ 	}
+ 
+diff --git a/net/netmon/interfaces_test.go b/net/netmon/interfaces_test.go
+index 34ddfe260d7188ae63f51f4e23953b5df2168f25..55728e706c300160c5974f38f34d24e83589f29f 100644
+--- a/net/netmon/interfaces_test.go
++++ b/net/netmon/interfaces_test.go
+@@ -7,6 +7,7 @@
+ 	"encoding/json"
+ 	"net"
+ 	"net/netip"
++	"os"
+ 	"slices"
+ 	"testing"
+ 
+@@ -429,3 +430,30 @@ func TestEqual(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestRegisterTunnelNameWithoutIndex(t *testing.T) {
++	oldName, oldIndex := tsIfProps.tsIfName(), tsIfProps.tsIfIndex()
++	t.Cleanup(func() { tsIfProps.set(oldName, oldIndex) })
++	const name = "missing-tunnel-for-netmon-test"
++	tstest.Replace(t, &kernelInterfaceByName, func(request string) (*net.Interface, error) {
++		if request != name {
++			t.Fatalf("unexpected kernel lookup for %q", request)
++		}
++		return nil, os.ErrPermission
++	})
++	SetTailscaleInterfaceProps("previous", 9)
++	tstest.Replace(t, &altNetInterfaces, func() ([]Interface, error) {
++		return []Interface{{Interface: &net.Interface{Name: name, Index: 42}}}, nil
++	})
++	SetTailscaleInterfaceProps(name, 0)
++	if got, err := TailscaleInterfaceName(); err != nil || got != name {
++		t.Fatalf("name = %q, %v, want %q", got, err, name)
++	}
++	if index, err := TailscaleInterfaceIndex(); err == nil || index != 0 {
++		t.Fatalf("kernel index = %d, %v, want unknown", index, err)
++	}
++	SetTailscaleInterfaceProps("", 0)
++	if _, err := TailscaleInterfaceName(); err == nil {
++		t.Fatal("name still registered after removal")
++	}
++}
