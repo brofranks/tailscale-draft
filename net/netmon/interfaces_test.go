@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net"
 	"net/netip"
+	"os"
 	"slices"
 	"testing"
 
@@ -427,5 +428,32 @@ func TestEqual(t *testing.T) {
 				t.Errorf("Equal = %v; want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestRegisterTunnelNameWithoutIndex(t *testing.T) {
+	oldName, oldIndex := tsIfProps.tsIfName(), tsIfProps.tsIfIndex()
+	t.Cleanup(func() { tsIfProps.set(oldName, oldIndex) })
+	const name = "missing-tunnel-for-netmon-test"
+	tstest.Replace(t, &kernelInterfaceByName, func(request string) (*net.Interface, error) {
+		if request != name {
+			t.Fatalf("unexpected kernel lookup for %q", request)
+		}
+		return nil, os.ErrPermission
+	})
+	SetTailscaleInterfaceProps("previous", 9)
+	tstest.Replace(t, &altNetInterfaces, func() ([]Interface, error) {
+		return []Interface{{Interface: &net.Interface{Name: name, Index: 42}}}, nil
+	})
+	SetTailscaleInterfaceProps(name, 0)
+	if got, err := TailscaleInterfaceName(); err != nil || got != name {
+		t.Fatalf("name = %q, %v, want %q", got, err, name)
+	}
+	if index, err := TailscaleInterfaceIndex(); err == nil || index != 0 {
+		t.Fatalf("kernel index = %d, %v, want unknown", index, err)
+	}
+	SetTailscaleInterfaceProps("", 0)
+	if _, err := TailscaleInterfaceName(); err == nil {
+		t.Fatal("name still registered after removal")
 	}
 }

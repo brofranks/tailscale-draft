@@ -46,6 +46,8 @@ func (m *Monitor) SetTailscaleInterfaceName(ifName string) {
 	SetTailscaleInterfaceProps(ifName, 0)
 }
 
+var kernelInterfaceByName = net.InterfaceByName
+
 // SetTailscaleInterfaceProps sets the name of the Tailscale interface and
 // its index for use by various listeners/dialers.  If the index is zero,
 // an attempt will be made to look it up by name.  This makes no attempt
@@ -56,20 +58,11 @@ func (m *Monitor) SetTailscaleInterfaceName(ifName string) {
 //
 // This should be called as early as possible during tailscaled startup.
 func SetTailscaleInterfaceProps(ifName string, ifIndex int) {
-	if ifIndex != 0 {
-		tsIfProps.set(ifName, ifIndex)
-		return
-	}
-
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return
-	}
-
-	for _, iface := range ifaces {
-		if iface.Name == ifName {
+	if ifName != "" && ifIndex == 0 {
+		// Only the OS can supply a kernel interface index. A provider may
+		// supply synthetic indices in its network inventory.
+		if iface, err := kernelInterfaceByName(ifName); err == nil {
 			ifIndex = iface.Index
-			break
 		}
 	}
 
