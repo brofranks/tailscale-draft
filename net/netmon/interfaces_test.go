@@ -127,6 +127,40 @@ func TestLikelyHomeRouterIP(t *testing.T) {
 	})
 }
 
+func TestLocalAddressesCGNAT(t *testing.T) {
+	oldName, oldIndex := tsIfProps.tsIfName(), tsIfProps.tsIfIndex()
+	t.Cleanup(func() { tsIfProps.set(oldName, oldIndex) })
+	iface := func(name, ip string) Interface {
+		host := netip.MustParseAddr(ip)
+		return Interface{Interface: &net.Interface{Name: name, Flags: net.FlagUp},
+			AltAddrs: []net.Addr{&net.IPNet{IP: host.AsSlice(), Mask: net.CIDRMask(host.BitLen(), host.BitLen())}}}
+	}
+	lan := iface("lan", "100.70.1.9")
+	tunnel := iface("wg0", "100.70.1.10")
+	otherVPN := iface("tailscale0", "100.82.2.3")
+	ula := iface("lan6", "fd7a:115c:a1e0:2::9")
+	ifs := []Interface{lan, tunnel, otherVPN, ula}
+	tstest.Replace(t, &altNetInterfaces, func() ([]Interface, error) { return ifs, nil })
+	for _, tc := range []struct {
+		name, registered string
+		want             []netip.Addr
+	}{
+		{"unregistered", "", nil},
+		{"registered", "wg0", []netip.Addr{netip.MustParseAddr("100.70.1.9"), netip.MustParseAddr("100.82.2.3")}},
+	} {
+		tsIfProps.set(tc.registered, 0)
+		got, _, err := LocalAddresses()
+		if err != nil || !slices.Equal(got, tc.want) {
+			t.Errorf("%s: %v, %v; want %v", tc.name, got, err, tc.want)
+		}
+	}
+	ifs = []Interface{ula}
+	got, _, err := LocalAddresses()
+	if err != nil || len(got) != 0 {
+		t.Errorf("ULA-only = %v, %v, want no candidates", got, err)
+	}
+}
+
 func TestLocalAddressesSkipsTailscaleInterface(t *testing.T) {
 	up := net.FlagUp | net.FlagBroadcast | net.FlagMulticast | net.FlagRunning
 	tstest.Replace(t, &altNetInterfaces, func() ([]Interface, error) {
