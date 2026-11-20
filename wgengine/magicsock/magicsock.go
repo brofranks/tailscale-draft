@@ -1308,10 +1308,6 @@ func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, erro
 	var already map[netip.AddrPort]tailcfg.EndpointType // endpoint -> how it was found
 	var eps []tailcfg.Endpoint                          // unique endpoints
 
-	ipp := func(s string) (ipp netip.AddrPort) {
-		ipp, _ = netip.ParseAddrPort(s)
-		return
-	}
 	addAddr := func(ipp netip.AddrPort, et tailcfg.EndpointType) {
 		if !ipp.IsValid() || (debugOmitLocalAddresses() && et == tailcfg.EndpointLocal) {
 			return
@@ -1403,26 +1399,12 @@ func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, erro
 		addAddr(ep, tailcfg.EndpointExplicitConf)
 	}
 
-	if localAddr := c.pconn4.LocalAddr(); localAddr.IP.IsUnspecified() {
-		ips, loopback, err := netmon.LocalAddresses()
-		if err != nil {
-			return nil, err
-		}
-		if len(ips) == 0 && len(eps) == 0 {
-			// Only include loopback addresses if we have no
-			// interfaces at all to use as endpoints and don't
-			// have a public IPv4 or IPv6 address. This allows
-			// for localhost testing when you're on a plane and
-			// offline, for example.
-			ips = loopback
-		}
-		for _, ip := range ips {
-			addAddr(netip.AddrPortFrom(ip, uint16(localAddr.Port)), tailcfg.EndpointLocal)
-		}
-	} else {
-		// Our local endpoint is bound to a particular address.
-		// Do not offer addresses on other local interfaces.
-		addAddr(ipp(localAddr.String()), tailcfg.EndpointLocal)
+	local, err := c.localEndpoints(len(eps) > 0)
+	if err != nil {
+		return nil, err
+	}
+	for _, ep := range local {
+		addAddr(ep, tailcfg.EndpointLocal)
 	}
 
 	// Note: the endpoints are intentionally returned in priority order,
@@ -1471,6 +1453,44 @@ func endpointSetsEqual(x, y []tailcfg.Endpoint) bool {
 		}
 	}
 	return true
+}
+
+// localEndpoints pairs each eligible address with the socket bound for its family.
+func (c *Conn) localEndpoints(haveOther bool) ([]netip.AddrPort, error) {
+	v4 := c.pconn4.LocalAddr().AddrPort()
+	v6 := c.pconn6.LocalAddr().AddrPort()
+	var eps []netip.AddrPort
+	for _, bound := range []netip.AddrPort{v4, v6} {
+		if bound.Port() != 0 && !bound.Addr().Unmap().IsUnspecified() {
+			eps = append(eps, netip.AddrPortFrom(bound.Addr().Unmap(), bound.Port()))
+		}
+	}
+	wildcard := func(ap netip.AddrPort) bool {
+		return ap.Port() != 0 && ap.Addr().Unmap().IsUnspecified()
+	}
+	if wildcard(v4) || wildcard(v6) {
+		ips, loopback, err := netmon.LocalAddresses()
+		if err != nil {
+			return nil, err
+		}
+		add := func(ips []netip.Addr) {
+			for _, ip := range ips {
+				bound := v6
+				if ip.Is4() {
+					bound = v4
+				}
+				if wildcard(bound) {
+					eps = append(eps, netip.AddrPortFrom(ip, bound.Port()))
+				}
+			}
+		}
+		add(ips)
+		// Offline peers can still find each other on loopback.
+		if len(eps) == 0 && !haveOther {
+			add(loopback)
+		}
+	}
+	return eps, nil
 }
 
 // LocalPort returns the current IPv4 listener's port number.

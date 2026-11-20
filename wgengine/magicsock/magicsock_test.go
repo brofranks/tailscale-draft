@@ -1365,10 +1365,12 @@ func testTwoDevicePing(t *testing.T, d *devices) {
 	addrPort := netip.MustParseAddrPort
 	m1Conns := []netlogtype.Connection{
 		{Src: addrPort("1.0.0.2:0"), Dst: m2.conn.pconn4.LocalAddr().AddrPort()},
+		{Src: addrPort("1.0.0.2:0"), Dst: m2.conn.pconn6.LocalAddr().AddrPort()},
 		{Src: addrPort("1.0.0.2:0"), Dst: addrPort("127.3.3.40:1")},
 	}
 	m2Conns := []netlogtype.Connection{
 		{Src: addrPort("1.0.0.1:0"), Dst: m1.conn.pconn4.LocalAddr().AddrPort()},
+		{Src: addrPort("1.0.0.1:0"), Dst: m1.conn.pconn6.LocalAddr().AddrPort()},
 		{Src: addrPort("1.0.0.1:0"), Dst: addrPort("127.3.3.40:1")},
 	}
 
@@ -5010,4 +5012,68 @@ func TestUnambiguousNodeKeyOfPingLocked(t *testing.T) {
 			t.Errorf("expected match, got mismatch, nodekey: %v", nk)
 		}
 	})
+}
+
+type localEndpointTestSocket struct {
+	*blockForeverConn
+	addr *net.UDPAddr
+}
+
+func (s localEndpointTestSocket) LocalAddr() net.Addr { return s.addr }
+
+func TestLocalEndpointPorts(t *testing.T) {
+	ip4 := netip.MustParseAddr("192.0.2.9")
+	ip6 := netip.MustParseAddr("2001:db8::9")
+	host := func(ip netip.Addr) net.Addr {
+		return &net.IPNet{IP: ip.AsSlice(), Mask: net.CIDRMask(ip.BitLen(), ip.BitLen())}
+	}
+	lan := netmon.Interface{Interface: &net.Interface{Name: "lan", Flags: net.FlagUp}, AltAddrs: []net.Addr{host(ip4), host(ip6)}}
+	lo := netmon.Interface{Interface: &net.Interface{Name: "lo", Flags: net.FlagUp | net.FlagLoopback},
+		AltAddrs: []net.Addr{host(netip.MustParseAddr("127.0.0.1")), host(netip.IPv6Loopback())}}
+	ifs := []netmon.Interface{lan, lo}
+	netmon.RegisterInterfaceGetter(func() ([]netmon.Interface, error) { return ifs, nil })
+	t.Cleanup(func() { netmon.RegisterInterfaceGetter(nil) })
+	for _, tc := range []struct {
+		name               string
+		v4, v6             string
+		offline, haveOther bool
+		want               []string
+	}{
+		{"separate-ports", "0.0.0.0:40101", "[::]:40202", false, false, []string{"192.0.2.9:40101", "[2001:db8::9]:40202"}},
+		{"fixed-v4", "192.0.2.8:40101", "[::]:40202", false, false, []string{"192.0.2.8:40101", "[2001:db8::9]:40202"}},
+		{"fixed-v6", "0.0.0.0:40101", "[2001:db8::8]:40202", false, false, []string{"192.0.2.9:40101", "[2001:db8::8]:40202"}},
+		{"missing-v4", "", "[::]:40202", false, false, []string{"[2001:db8::9]:40202"}},
+		{"missing-v6", "0.0.0.0:40101", "", false, false, []string{"192.0.2.9:40101"}},
+		{"offline", "0.0.0.0:40101", "[::]:40202", true, false, []string{"127.0.0.1:40101", "[::1]:40202"}},
+		{"public-endpoint", "0.0.0.0:40101", "[::]:40202", true, true, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.offline {
+				ifs = []netmon.Interface{lo}
+			} else {
+				ifs = []netmon.Interface{lan, lo}
+			}
+			socket := func(s string) localEndpointTestSocket {
+				addr := new(net.UDPAddr)
+				if s != "" {
+					addr = net.UDPAddrFromAddrPort(netip.MustParseAddrPort(s))
+				}
+				return localEndpointTestSocket{addr: addr}
+			}
+			var c Conn
+			c.pconn4.pconn, c.pconn6.pconn = socket(tc.v4), socket(tc.v6)
+			got, err := c.localEndpoints(tc.haveOther)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var ss []string
+			for _, ep := range got {
+				ss = append(ss, ep.String())
+			}
+			slices.Sort(ss)
+			if !slices.Equal(ss, tc.want) {
+				t.Errorf("local endpoints = %v, want %v", ss, tc.want)
+			}
+		})
+	}
 }
