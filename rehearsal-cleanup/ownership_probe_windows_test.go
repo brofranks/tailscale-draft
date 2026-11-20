@@ -6,7 +6,9 @@ package osrouter
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +20,7 @@ import (
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/usermetric"
 	"tailscale.com/wgengine"
+	"tailscale.com/wgengine/router"
 )
 
 // This harness runs only on a disposable runner with the pinned Wintun DLL.
@@ -49,12 +52,30 @@ func TestNativeFirewallOwnership(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	router, err := newUserspaceRouter(logf, dev, mon, h, b)
+	hostRouter, err := newUserspaceRouter(logf, dev, mon, h, b)
 	if err != nil {
 		dev.Close()
 		t.Fatal(err)
 	}
-	r := router.(*winRouter)
+	r := hostRouter.(*winRouter)
+	deadline := time.NewTimer(90 * time.Second)
+	defer deadline.Stop()
+	waitIdle := func() bool {
+		t.Helper()
+		for {
+			r.firewall.mu.Lock()
+			running, known := r.firewall.running, r.firewall.known
+			r.firewall.mu.Unlock()
+			if !running {
+				return known
+			}
+			select {
+			case <-idle:
+			case <-deadline.C:
+				t.Fatal("firewall worker did not finish")
+			}
+		}
+	}
 	switch mode {
 	case "before":
 		wanted := errors.New("controlled failure before router.Up")
@@ -73,26 +94,31 @@ func TestNativeFirewallOwnership(t *testing.T) {
 			r.Close()
 			t.Fatal(err)
 		}
+		addr := netip.MustParsePrefix("192.0.2.77/32")
+		if err := r.Set(&router.Config{LocalAddrs: []netip.Prefix{addr}}); err != nil {
+			t.Fatal(err)
+		}
+		if !waitIdle() {
+			t.Fatal("firewall worker has not applied local addresses")
+		}
+		query := `$ErrorActionPreference='Stop'
+$rules = @(Get-NetFirewallRule -DisplayName Tailscale-In)
+if ($rules.Count -ne 1 -or $rules[0].Enabled -ne 'True' -or $rules[0].Action -ne 'Allow') { throw 'expected one enabled Tailscale-In allow rule' }
+($rules[0] | Get-NetFirewallAddressFilter).LocalAddress`
+		out, err := exec.Command("powershell.exe", "-NonInteractive", "-NoProfile", "-Command", query).CombinedOutput()
+		if err != nil {
+			t.Fatalf("query active firewall rule: %v: %s", err, out)
+		}
+		local := strings.TrimSpace(string(out))
+		if local != addr.Addr().String() && local != addr.String() && local != addr.Addr().String()+"/255.255.255.255" {
+			t.Fatalf("unexpected local firewall address %q", local)
+		}
+		t.Logf("RESULT owned Tailscale-In enabled for %s before Close", addr.Addr())
 		if err := r.Close(); err != nil {
 			t.Fatal(err)
 		}
 	default:
 		t.Fatal("unknown probe mode")
 	}
-	deadline := time.NewTimer(90 * time.Second)
-	defer deadline.Stop()
-	for {
-		r.firewall.mu.Lock()
-		running, known := r.firewall.running, r.firewall.known
-		r.firewall.mu.Unlock()
-		if !running {
-			t.Logf("RESULT native Wintun mode=%s firewall worker idle, completed netsh work=%v", mode, known)
-			return
-		}
-		select {
-		case <-idle:
-		case <-deadline.C:
-			t.Fatal("firewall worker did not finish")
-		}
-	}
+	t.Logf("RESULT native Wintun mode=%s firewall worker idle, completed netsh work=%v", mode, waitIdle())
 }
