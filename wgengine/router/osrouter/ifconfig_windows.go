@@ -336,7 +336,6 @@ func configureInterface(cfg *router.Config, tun *tun.NativeTun, ht *health.Track
 	// routes from being marked as on-link. We can still create on-link routes
 	// for single-host Tailscale routes, but we shouldn't attempt to create a
 	// route for the interface's own IP.
-	var localAddr4, localAddr6 netip.Addr
 	var gatewayAddr4, gatewayAddr6 netip.Addr
 	addresses := make([]netip.Prefix, 0, len(cfg.LocalAddrs))
 	for _, addr := range cfg.LocalAddrs {
@@ -346,10 +345,8 @@ func configureInterface(cfg *router.Config, tun *tun.NativeTun, ht *health.Track
 		}
 		addresses = append(addresses, addr)
 		if addr.Addr().Is4() && !gatewayAddr4.IsValid() {
-			localAddr4 = addr.Addr()
 			gatewayAddr4 = tsaddr.TailscaleServiceIP()
 		} else if addr.Addr().Is6() && !gatewayAddr6.IsValid() {
-			localAddr6 = addr.Addr()
 			gatewayAddr6 = tsaddr.TailscaleServiceIPv6()
 		}
 	}
@@ -378,17 +375,13 @@ func configureInterface(cfg *router.Config, tun *tun.NativeTun, ht *health.Track
 			return errors.New("due to a Windows limitation, one cannot have interface routes without an interface address")
 		}
 
-		var gateway, localAddr netip.Addr
-		if route.Addr().Is4() {
-			localAddr = localAddr4
-			gateway = gatewayAddr4
-		} else if route.Addr().Is6() {
-			localAddr = localAddr6
+		gateway := gatewayAddr4
+		if route.Addr().Is6() {
 			gateway = gatewayAddr6
 		}
 
 		switch destAddr := route.Addr().Unmap(); {
-		case destAddr == localAddr:
+		case isLocalHostRoute(route, addresses):
 			// no need to add a route for the interface's
 			// own IP. The kernel does that for us.
 			// If we try to replace it, we'll fail to
