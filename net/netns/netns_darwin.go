@@ -33,6 +33,7 @@ func control(logf logger.Logf, netMon *netmon.Monitor) func(network, address str
 var bindToInterfaceByRouteEnv = envknob.RegisterBool("TS_BIND_TO_INTERFACE_BY_ROUTE")
 
 var errInterfaceStateInvalid = errors.New("interface state invalid")
+var errTunnelUnderlay = errors.New("default route selects the tunnel interface")
 
 // controlLogf binds c to a particular interface as necessary to dial the
 // provided (network, address).
@@ -47,6 +48,9 @@ func controlLogf(logf logger.Logf, netMon *netmon.Monitor, network, address stri
 
 	idx, err := getInterfaceIndex(logf, netMon, address)
 	if err != nil {
+		if errors.Is(err, errTunnelUnderlay) {
+			return err
+		}
 		// callee logged
 		return nil
 	}
@@ -68,7 +72,7 @@ func getInterfaceIndex(logf logger.Logf, netMon *netmon.Monitor, address string)
 				}
 				return -1, err
 			}
-			return idx, nil
+			return checkDefaultInterface(idx, nil)
 		}
 		state := netMon.InterfaceState()
 		if state == nil {
@@ -98,15 +102,7 @@ func getInterfaceIndex(logf logger.Logf, netMon *netmon.Monitor, address string)
 			logf("netns: [unexpected] os default if %q (%d) != netmon cached if %q (%d)", osIf.InterfaceName, osIf.InterfaceIndex, cachedIdx.Name, cachedIdx.Index)
 		}
 
-		// Sanity check to make sure we didn't pick the tailscale interface
-		if tsif, err2 := tailscaleInterface(); tsif != nil && err2 == nil && errOut == nil {
-			if tsif.Index == idx {
-				idx = -1
-				errOut = errInterfaceStateInvalid
-			}
-		}
-
-		return idx, errOut
+		return checkDefaultInterface(idx, errOut)
 	}
 
 	useRoute := bindToInterfaceByRoute.Load() || bindToInterfaceByRouteEnv()
@@ -143,10 +139,28 @@ func getInterfaceIndex(logf logger.Logf, netMon *netmon.Monitor, address string)
 	return idx, err
 }
 
+// checkDefaultInterface prevents a confirmed tunnel route from being used
+// as the underlay, including when no monitor was provided.
+func checkDefaultInterface(idx int, err error) (int, error) {
+	if err == nil {
+		name, _ := netmon.TailscaleInterfaceName()
+		if name == "" {
+			return idx, nil
+		}
+		if iface, lookupErr := net.InterfaceByIndex(idx); lookupErr == nil && iface.Name == name {
+			return -1, errTunnelUnderlay
+		}
+	}
+	return idx, err
+}
+
 // tailscaleInterface returns the current machine's Tailscale interface, if any.
 // If none is found, (nil, nil) is returned.
-// A non-nil error is only returned on a problem listing the system interfaces.
+// A registered name is authoritative, even if that device no longer exists.
 func tailscaleInterface() (*net.Interface, error) {
+	if name, err := netmon.TailscaleInterfaceName(); err == nil {
+		return net.InterfaceByName(name)
+	}
 	ifs, err := net.Interfaces()
 	if err != nil {
 		return nil, err
