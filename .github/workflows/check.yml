@@ -33,5 +33,9 @@ jobs:
         shell: bash
         run: |
           read -r _ base < ../upstream
-          git diff --name-only "$base" HEAD -- '*.go' | xargs -r dirname | sort -u |
+          if ! git diff --quiet "$base" HEAD -- 'cmd/tsconnect/wasm/*.go'; then
+              GOOS=js GOARCH=wasm ./tool/go build -o "$RUNNER_TEMP/tsconnect.wasm" ./cmd/tsconnect/wasm
+          fi
+          git diff --name-only "$base" HEAD -- '*.go' ':(exclude)cmd/tsconnect/wasm/*.go' |
+              xargs -r dirname | sort -u |
               sed 's|^|./|' | xargs -r ./tool/go run ./cmd/testwrapper -race
